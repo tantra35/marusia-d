@@ -489,8 +489,10 @@ func pactlOutput(args ...string) (string, error) {
 	return string(out), nil
 }
 
-// volumeColor — цвет вспышки громкости: плавный градиент от синего (0%)
-// к оранжевому (VOLUME_MAX_PCT). pct=-1 — уровень не узнали: белая.
+// volumeColor — цвет вспышки громкости, двухсегментный градиент:
+//   0..половины — синий → зелёный (B убывает, G растёт);
+//   половина..максимума — зелёный → оранжевый (R растёт, G спадает до 140).
+// pct=-1 — уровень не узнали: белая.
 func volumeColor(pct int) ring.Color {
 	if pct < 0 {
 		return ring.White
@@ -499,11 +501,17 @@ func volumeColor(pct int) ring.Color {
 	if t > 1 {
 		t = 1
 	}
-	return ring.Color{
-		R: uint8(255 * t),
-		G: uint8(140 * t),
-		B: uint8(255 * (1 - t)),
+	var r, g, b float64
+	if t <= 0.5 {
+		s := t / 0.5
+		g = 255 * s
+		b = 255 * (1 - s)
+	} else {
+		s := (t - 0.5) / 0.5
+		r = 255 * s
+		g = 255 - (255-140)*s // на максимуме оранжевый (255,140,0)
 	}
+	return ring.Color{R: byte(r), G: byte(g), B: byte(b)}
 }
 
 // playSound — короткий сервисный звук через paplay, не ждём окончания.
