@@ -408,26 +408,33 @@ func (r *Ring) start(key string, args []string) error {
 	return nil
 }
 
-// ensureSPI — следить, что контроллер meson-spicc привязан и узел есть.
-// После кривых rebind'ов (наших или ringled) и неудачного пробега контроллер
-// может остаться непривязанным — тогда ringled умирает с «no meson-spicc
-// device bound to rebind».
-//
-// Узел создаёт mdev по uevent, и на горячих циклах unbind/bind он может
-// не успевать/теряться — поэтому после bind принудительно пересканируем
-// mdev -s, пока узел не появится.
+// ensureSPI — следить, что контроллер meson-spicc привязан и узел жив.
+// Два вида мусора после горячих rebind-циклов:
+//  1. контроллер не привязан → ringled умирает «no meson-spicc device
+//     bound to rebind»;
+//  2. узел-висяк: файл есть (Stat проходит!), но inode указывает в никуда
+//     после unregister — любое открытие даёт ENOENT/ENXIO.
+// Поэтому живость проверяем реальным открытием, а не Stat. Узел создаёт
+// mdev по uevent и на горячих циклах тупит — после bind принудительно
+// гоняем mdev -s, пока устройство не откроется.
 func (r *Ring) ensureSPI() error {
 	const (
 		driverLink = "/sys/bus/platform/devices/ffd13000.spi/driver"
 		bindPath   = "/sys/bus/platform/drivers/meson-spicc/bind"
 	)
-	node := func() bool {
-		_, err := os.Stat(r.dev)
-		return err == nil
+	alive := func() bool {
+		f, err := os.OpenFile(r.dev, os.O_RDWR, 0)
+		if err != nil {
+			return false
+		}
+		f.Close()
+		return true
 	}
-	if node() {
+	if alive() {
 		return nil
 	}
+	// мёртвый узел мешает mdev создать свежий — снести
+	os.Remove(r.dev)
 	// привязать контроллер, если драйвер не на месте
 	if drv, err := os.Readlink(driverLink); err != nil || !strings.HasSuffix(drv, "/meson-spicc") {
 		bind, err := os.OpenFile(bindPath, os.O_WRONLY, 0)
@@ -442,14 +449,14 @@ func (r *Ring) ensureSPI() error {
 	mdev()
 	for i := 0; i < 500; i++ { // до 2 с
 		time.Sleep(4 * time.Millisecond)
-		if node() {
+		if alive() {
 			return nil
 		}
 		if i%25 == 0 { // раз в 100 мс повторный mdev -s
 			mdev()
 		}
 	}
-	return fmt.Errorf("%s не появился после bind meson-spicc", r.dev)
+	return fmt.Errorf("%s не открылся после bind meson-spicc + mdev -s", r.dev)
 }
 
 // killProc — SIGKILL текущему ringled и полное ожидание его смерти
