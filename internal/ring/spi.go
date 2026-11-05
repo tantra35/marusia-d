@@ -28,7 +28,8 @@ const (
 	primeHz      = 1000000
 	primeLen     = 16
 	resetLen     = 128
-	bytesPerLED  = 12 // 24 бита × 4 SPI-бита / 8
+	frameLen     = resetLen*2 + leds*bytesPerLED // 400: reset + payload + reset
+	bytesPerLED  = 12                            // 24 бита × 4 SPI-бита / 8
 	spiMajor     = 153
 	spiMinor     = 0
 	rebindSettle = 15 * time.Millisecond // пауза unbind→bind
@@ -47,18 +48,24 @@ func encodeByte(b byte) [4]byte {
 	return [4]byte{byte(out >> 24), byte(out >> 16), byte(out >> 8), byte(out)}
 }
 
-// encodeFrame — кадр целиком: reset + GRB-пиксели + reset.
-func encodeFrame(px [leds][3]byte) []byte {
-	f := make([]byte, 0, resetLen*2+leds*bytesPerLED)
-	f = append(f, make([]byte, resetLen)...)
+// encodeFrameInto — собрать кадр в БУФЕР ДМА (dst[:0]): reset + GRB-пиксели
+// + reset. Буфер передаётся постоянный (Ring.frameBuf): его физические
+// страницы не возвращаются ядру между кадрами, и cache-sync при unmap
+// всегда падает на наши же данные.
+func encodeFrameInto(dst []byte, px [leds][3]byte) []byte {
+	dst = dst[:0]
+	dst = append(dst, make([]byte, resetLen)...)
 	for _, p := range px {
 		for _, ch := range []byte{p[1], p[0], p[2]} { // GRB
 			e := encodeByte(ch)
-			f = append(f, e[:]...)
+			dst = append(dst, e[:]...)
 		}
 	}
-	f = append(f, make([]byte, resetLen)...)
-	return f
+	dst = append(dst, make([]byte, resetLen)...)
+	if len(dst) != frameLen {
+		panic(fmt.Sprintf("кадр %d байт, ожидалось %d", len(dst), frameLen))
+	}
+	return dst
 }
 
 // spiXfer — struct spi_ioc_transfer, uapi-порядок полей (bits_per_word ПЕРЕД
@@ -81,7 +88,11 @@ func iocMessage(n int) uintptr {
 }
 
 // draw — rebind + открыть узел + отправить кадр. Блокирует ~30–60 мс.
-func (r *Ring) draw(frame []byte) error {
+// ДМА-буферы — постоянные поля Ring (primeBuf/frameBuf): их физические
+// страницы не возвращаются ядру между кадрами, поэтому dma_sync при unmap
+// не может зацепить чужие ядерные структуры (источник порчи при чане
+// свежих буферов — см. Oops 2026-11-06).
+func (r *Ring) draw() error {
 	// unbind: «уже отвязан» игнорируем; bind: свежий probe → живой делитель
 	os.WriteFile("/sys/bus/platform/drivers/meson-spicc/unbind", []byte("ffd13000.spi"), 0644)
 	time.Sleep(rebindSettle)
@@ -95,10 +106,9 @@ func (r *Ring) draw(frame []byte) error {
 	}
 	defer f.Close()
 
-	prime := make([]byte, primeLen)
 	tx := []spiXfer{
-		{txBuf: uint64(uintptr(unsafe.Pointer(&prime[0]))), len: primeLen, speed: primeHz, bits: 8},
-		{txBuf: uint64(uintptr(unsafe.Pointer(&frame[0]))), len: uint32(len(frame)), speed: frameHz, bits: 8},
+		{txBuf: uint64(uintptr(unsafe.Pointer(&r.primeBuf[0]))), len: primeLen, speed: primeHz, bits: 8},
+		{txBuf: uint64(uintptr(unsafe.Pointer(&r.frameBuf[0]))), len: uint32(len(r.frameBuf)), speed: frameHz, bits: 8},
 	}
 	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocMessage(len(tx)), uintptr(unsafe.Pointer(&tx[0]))); e != 0 {
 		return fmt.Errorf("SPI_IOC_MESSAGE: %w", e)

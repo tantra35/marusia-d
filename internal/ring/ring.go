@@ -99,15 +99,22 @@ type Ring struct {
 	lastDrawn    string    // ключ последнего нарисованного статичного кадра
 	lastAnimDraw time.Time // время последнего анимационного кадра (прореживание)
 
+	// DMA-буферы: выделяются один раз и живут вечно — их физические
+	// страницы не возвращаются ядру и не переиспользуются, что исключает
+	// порчу при cache-sync на чужих диапазонах (см. spi.go).
+	frameBuf []byte // 400 байт: reset + payload + reset
+	primeBuf []byte // 16 байт primer @1 МГц
 }
 
 func New(dev string, n int) *Ring {
 	return &Ring{
-		dev:   dev,
-		n:     n,
-		cmdCh: make(chan ringCmd),
-		scale: 1,
-		mpd:   "off",
+		dev:      dev,
+		n:        n,
+		cmdCh:    make(chan ringCmd),
+		scale:    1,
+		mpd:      "off",
+		frameBuf: make([]byte, resetLen*2+leds*bytesPerLED),
+		primeBuf: make([]byte, primeLen),
 	}
 }
 
@@ -333,7 +340,8 @@ func (r *Ring) render(now time.Time) {
 	if animated && now.Sub(r.lastAnimDraw) < animFrameInterval {
 		return // прореживание анимаций: ≤8 rebind/с вместо 25
 	}
-	if err := r.draw(encodeFrame(px)); err != nil {
+	encodeFrameInto(r.frameBuf[:0], px) // заполнить DMA-буфер
+	if err := r.draw(); err != nil {
 		log.Printf("ring: draw: %v", err)
 		r.lastDrawn = "" // повторить при следующем тике
 		return
@@ -364,7 +372,8 @@ func (r *Ring) Serve(ctx context.Context) {
 		case <-ctx.Done():
 			// кадр в диодах защёлкнут — погасить кольцо напоследок
 			var black [12][3]byte
-			if err := r.draw(encodeFrame(black)); err != nil {
+			encodeFrameInto(r.frameBuf[:0], black) // заполнить DMA-буфер
+			if err := r.draw(); err != nil {
 				log.Printf("ring: финальное гашение: %v", err)
 			}
 			return
