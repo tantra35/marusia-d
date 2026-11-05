@@ -25,10 +25,11 @@ const (
 	DefaultDevice = "/dev/spidev0.0"
 	leds          = 12
 
-	renderInterval = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
-	breathePeriod  = 1500 * time.Millisecond
-	blinkPeriod    = 500 * time.Millisecond
-	FLASH_MS       = 1200 * time.Millisecond // вспышка громкости: полный спад
+	renderInterval    = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
+	breathePeriod     = 1500 * time.Millisecond
+	blinkPeriod       = 500 * time.Millisecond
+	FLASH_MS          = 1200 * time.Millisecond // вспышка громкости: полный спад
+	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
 )
 
 // Палитра сцен (RGB). var, не const: литералы массивов в Go константами не бывают.
@@ -95,7 +96,9 @@ type Ring struct {
 	overlayDur   time.Duration // её полная длительность (спад)
 	overlayTt    time.Time     // когда вспышка истекает; zero = нет
 
-	lastDrawn string // ключ последнего нарисованного статичного кадра ("" после анимации)
+	lastDrawn    string    // ключ последнего нарисованного статичного кадра
+	lastAnimDraw time.Time // время последнего анимационного кадра (прореживание)
+
 }
 
 func New(dev string, n int) *Ring {
@@ -319,11 +322,16 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 }
 
 // render — нарисовать кадр, если он отличается от уже показанного.
-// Анимации рисуются всегда (фаза меняется). Только в акторе.
+// Анимации рисуются не чаще animFps: каждый кадр = rebind контроллера,
+// а частый rebind портит память ядра (UAF в bind/unbind spidev, см.
+// ~/marusia-serial.log Oops 2026-11-06). Только в акторе.
 func (r *Ring) render(now time.Time) {
 	key, px, animated := r.frame(now)
 	if !animated && key == r.lastDrawn {
 		return // статичный кадр уже на диодах
+	}
+	if animated && now.Sub(r.lastAnimDraw) < animFrameInterval {
+		return // прореживание анимаций: ≤8 rebind/с вместо 25
 	}
 	if err := r.draw(encodeFrame(px)); err != nil {
 		log.Printf("ring: draw: %v", err)
@@ -331,6 +339,7 @@ func (r *Ring) render(now time.Time) {
 		return
 	}
 	if animated {
+		r.lastAnimDraw = now
 		r.lastDrawn = "" // после анимации статичную сцену перерисовать
 	} else {
 		r.lastDrawn = key
