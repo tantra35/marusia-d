@@ -1,0 +1,22 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"go.terminal.activateEnvironment": true,
+		"go.gopath": "/home/ruslan/.local/lib/golang",
+		"go.goroot": "/opt/go-1.26.10",
+		"go.alternateTools": {
+			"go": "/opt/go-1.26.10/bin/go",
+			"gopls": "/home/ruslan/.local/lib/golang/bin/gopls"
+		},
+		"go.toolsEnvVars": {
+			"GOTOOLCHAIN": "local"
+		},
+		"vscode-acp.agentPaths": {
+			"hermes": "hermes"
+		}
+	}
+}

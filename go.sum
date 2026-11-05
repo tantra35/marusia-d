@@ -1,0 +1,6 @@
+github.com/fhs/gompd/v2 v2.3.0 h1:wuruUjmOODRlJhrYx73rJnzS7vTSXSU7pWmZtM3VPE0=
+github.com/fhs/gompd/v2 v2.3.0/go.mod h1:nNdZtcpD5VpmzZbRl5rV6RhxeMmAWTxEsSIMBkmMIy4=
+github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+github.com/holoplot/go-evdev v0.0.0-20260909133534-d873ed210bda h1:/5a6e/KLg8R+KhKxK+ze8CPBumoJQwN64KSHksirun0=
+github.com/holoplot/go-evdev v0.0.0-20260909133534-d873ed210bda/go.mod h1:iHAf8OIncO2gcQ8XOjS7CMJ2aPbX2Bs0wl5pZyanEqk=
