@@ -55,11 +55,12 @@ const (
 
 // звук отклика на кнопки громкости (кладка в rootfs: /etc/sounds)
 const (
-	SOUND_VOLUME   = "/etc/sounds/13_volume_voice.flac"
-	SOUND_MIC_OFF  = "/etc/sounds/05_mic_on_to_mic_off.flac"
-	SOUND_MIC_ON   = "/etc/sounds/06_mic_off_to_mic_on.flac"
-	FLASH_MS       = 800 * time.Millisecond // вспышка громкости: дыхание 0.8 с
-	VOLUME_MAX_PCT = 150                    // потолок громкости sink, больше нельзя
+	SOUND_VOLUME      = "/etc/sounds/13_volume_voice.flac"
+	SOUND_MIC_OFF     = "/etc/sounds/05_mic_on_to_mic_off.flac"
+	SOUND_MIC_ON      = "/etc/sounds/06_mic_off_to_mic_on.flac"
+	FLASH_MS          = 800 * time.Millisecond // вспышка громкости: дыхание 0.8 с
+	VOLUME_MAX_PCT    = 150                    // физическая громкость sink, больше нельзя
+	VOLUME_VISUAL_MAX = 100                    // визуальная шкала (кольцо, панель): 0..100
 )
 
 // mpdLink — переподключающийся клиент MPD. conn и watcher живут в своей
@@ -256,7 +257,8 @@ func main() {
 	// ---------- сенсорная панель ----------
 	// громкость — СИСТЕМНАЯ (sink PulseAudio), а не mpd: через sink проходит
 	// всё — музыка mpd, служебные звуки, голос ассистента.
-	// getSinkPct — текущая громкость default sink в процентах 0..100, -1 = не узнали.
+	// getSinkPct — текущая физическая громкость default sink в процентах
+	// 0..VOLUME_MAX_PCT, -1 = не узнали.
 	getSinkPct := func() int {
 		out, err := pactlOutput("get-sink-volume", "@DEFAULT_SINK@")
 		if err != nil {
@@ -272,10 +274,11 @@ func main() {
 		return -1
 	}
 	// volFeedback — отклик на смену громкости: звук, вспышка всего кольца
-	// одним цветом уровня (синий при 0 → оранжевый при 150, breathe-затухание),
-	// проценты на панели-часах. Звук ПЕРВЫМ: Flash синхронный — блокирует до
-	// конца анимации (~FLASH_MS), иначе paplay отставал бы на вспышку.
-	// pct=-1 — громкость не узнали: вспышка белая, панель не трогаем.
+	// одним цветом уровня, проценты на панели-часах. Звук ПЕРВЫМ: Flash
+	// синхронный — блокирует до конца анимации (~FLASH_MS), иначе paplay
+	// отставал бы на вспышку. pct — ВИЗУАЛЬНАЯ громкость 0..100; перевод
+	// из физики sink 0..150 (toVisual) делает вызывающий. pct=-1 —
+	// громкость не узнали: вспышка белая, панель не трогаем.
 	volFeedback := func(pct int) {
 		playSound(SOUND_VOLUME)
 		rg.Flash(volumeColor(pct), FLASH_MS)
@@ -283,7 +286,7 @@ func main() {
 			clk.ShowVolume(pct)
 		}
 	}
-	// абсолютная громкость sink строго в процентах 0..100 (не доля 0..1!)
+	// абсолютная физическая громкость sink 0..VOLUME_MAX_PCT (не доля 0..1!)
 	setSinkPct := func(p int) {
 		if p < 0 {
 			p = 0
@@ -295,16 +298,17 @@ func main() {
 	}
 	// громкость через API (DLNA/HA → mpd setvol → событие mixer). Протокол
 	// MPD ограничен setvol 0..100, но mpd сам масштабирует свой поток
-	// (scale_volume "1.5" в mpd.conf: setvol 100 = 150% на PA). Демон по
-	// событию только реагирует — вспышка кольца и проценты на панели
-	// в нашей шкале 0..150; sink не трогаем (его двигают кнопки/HA).
+	// (scale_volume "1.5" в mpd.conf: setvol 100 = 150% на PA). Шкала mpd
+	// 0..100 линейно совпадает с визуальной (setvol 50 = sink 75 = «50»),
+	// так что процент mpd идёт в отклик как есть; sink не трогаем
+	// (его двигают кнопки/HA).
 	var lastVolNotify time.Time
 	mpdLink.onVolume = func(pct int) {
 		if time.Since(lastVolNotify) < 700*time.Millisecond {
 			return
 		}
 		lastVolNotify = time.Now()
-		volFeedback(pct * VOLUME_MAX_PCT / 100)
+		volFeedback(pct)
 	}
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
@@ -323,7 +327,7 @@ func main() {
 		pct := getSinkPct()
 		if pct >= 0 {
 			if (up && pct >= VOLUME_MAX_PCT) || (!up && pct <= 0) {
-				volFeedback(pct) // на пределе — оранжевый отклик, не шагаем
+				volFeedback(toVisual(pct)) // на пределе — оранжевый отклик, не шагаем
 				return
 			}
 		}
@@ -336,7 +340,7 @@ func main() {
 			setSinkPct(VOLUME_MAX_PCT) // PA умеет >150% — режем потолком
 			pct = VOLUME_MAX_PCT
 		}
-		volFeedback(pct)
+		volFeedback(toVisual(pct))
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
 	// Производитель — touch-горутина; потребитель — ровно один (ниже):
@@ -420,9 +424,10 @@ func main() {
 			case "snapshot":
 				rg.SetSnapshot(e.Bool("muted"))
 				if e.Has("volume") {
-					// upstream: volume — доля 0.0..1.0; sink — источник истины
-					// по громкости колонки, синхронизируем при коннекте
-					setSinkPct(int(math.Round(e.Float("volume") * 100)))
+					// upstream: volume — доля 0.0..1.0 от максимума колонки
+					// (150%); sink — источник истины по громкости колонки,
+					// синхронизируем при коннекте в физической шкале
+					setSinkPct(int(math.Round(e.Float("volume") * VOLUME_MAX_PCT)))
 				}
 			case "zeroconf":
 				if e.Str("status") == "connected" {
@@ -467,11 +472,12 @@ func main() {
 				// музыка через LVA (HA media player) — та же радуга, что и mpd
 				rg.SetMPD("rainbow")
 			case "volume_changed":
-				// upstream: {"volume": float} 0.0..1.0 — применяем к sink
-				// (у LVA аудио уходит в наш sink, так что это одна и та же громкость)
-				pct := int(math.Round(e.Float("volume") * 100))
+				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
+				// колонки (150%); sink — в физической шкале, в отклик —
+				// визуальные 0..100 (toVisual)
+				pct := int(math.Round(e.Float("volume") * VOLUME_MAX_PCT))
 				setSinkPct(pct)
-				volFeedback(pct)
+				volFeedback(toVisual(pct))
 			case "light_command":
 				lc := e.LightCommand()
 				if lc.ObjectID != "ring" {
@@ -530,7 +536,19 @@ func pactlOutput(args ...string) (string, error) {
 	return string(out), nil
 }
 
-// volumeColor — цвет вспышки громкости, двухсегментный градиент:
+// toVisual — физическая громкость sink (0..VOLUME_MAX_PCT) → визуальная
+// шкала 0..VOLUME_VISUAL_MAX: на кольце и панели громкость всегда 0..100,
+// физические 150% показываются как 100. Отрицательное (-1 = «не узнали»)
+// проходит насквозь без перевода.
+func toVisual(pct int) int {
+	if pct < 0 {
+		return -1
+	}
+	return pct * VOLUME_VISUAL_MAX / VOLUME_MAX_PCT
+}
+
+// volumeColor — цвет вспышки громкости, двухсегментный градиент по
+// ВИЗУАЛЬНОЙ шкале 0..VOLUME_VISUAL_MAX:
 //
 //	0..половины — синий → зелёный (B убывает, G растёт);
 //	половина..максимума — зелёный → оранжевый (R растёт, G спадает до 140).
@@ -540,7 +558,7 @@ func volumeColor(pct int) ring.Color {
 	if pct < 0 {
 		return ring.White
 	}
-	t := float64(pct) / float64(VOLUME_MAX_PCT)
+	t := float64(pct) / float64(VOLUME_VISUAL_MAX)
 	if t > 1 {
 		t = 1
 	}
