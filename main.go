@@ -147,7 +147,9 @@ func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
 				}
 			case "mixer":
 				// громкость сменилась через API (DLNA/HA → mpd setvol):
-				// прокинуть в демона — sink, вспышка кольца, панель
+				// прокинуть в демона — отклик (вспышка кольца, панель).
+				// Sink демон здесь НЕ трогает: масштаб 0..100 → 0..150
+				// делает сам mpd (scale_volume в mpd.conf).
 				if m.onVolume == nil {
 					break
 				}
@@ -281,17 +283,17 @@ func main() {
 		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 	}
 	// громкость через API (DLNA/HA → mpd setvol → событие mixer). Протокол
-	// MPD ограничен setvol 0..100 — масштабируем в нашу шкалу 0..150:
-	// слайдер на максимуме = реальные 150% на sink (как кнопки).
+	// MPD ограничен setvol 0..100, но mpd сам масштабирует свой поток
+	// (scale_volume "1.5" в mpd.conf: setvol 100 = 150% на PA). Демон по
+	// событию только реагирует — вспышка кольца и проценты на панели
+	// в нашей шкале 0..150; sink не трогаем (его двигают кнопки/HA).
 	var lastVolNotify time.Time
 	mpdLink.onVolume = func(pct int) {
 		if time.Since(lastVolNotify) < 700*time.Millisecond {
 			return
 		}
 		lastVolNotify = time.Now()
-		scaled := pct * VOLUME_MAX_PCT / 100
-		setSinkPct(scaled)
-		volFeedback(scaled)
+		volFeedback(pct * VOLUME_MAX_PCT / 100)
 	}
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA

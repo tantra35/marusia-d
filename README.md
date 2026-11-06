@@ -53,6 +53,8 @@ LVA подключается к ней сам. Колонка не знает а
 Обратно (сенсорные кнопки): 114/115 → при подключённом LVA — upstream-команды
 `volume_up`/`volume_down` (LVA меняет громкость, шлёт `volume_changed`, sink
 подтягивается; значение живёт в LVA/HA), автономно — локально `pactl` на sink.
+Громкость mpd (DLNA) живёт в своём потоке (scale_volume "1.5" в mpd.conf),
+sink демоном не зеркалится.
 582 → `start_listening`, 148 → `mute_mic`/`unmute_mic`
 (сверить keycode'и на устройстве!). С `-lva-light` (по умолчанию) кольцо
 регистрируется как light-сущность HA (`light.<satellite>_ring`): вкл/выкл, яркость
