@@ -16,6 +16,7 @@ package ring
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"time"
@@ -28,7 +29,7 @@ const (
 	renderInterval    = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
 	breathePeriod     = 1500 * time.Millisecond
 	blinkPeriod       = 500 * time.Millisecond
-	FLASH_MS          = 1200 * time.Millisecond // вспышка громкости: полный спад
+	FLASH_MS          = 800 * time.Millisecond   // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
 )
 
@@ -96,8 +97,9 @@ type Ring struct {
 	overlayDur   time.Duration // её полная длительность (спад)
 	overlayTt    time.Time     // когда вспышка истекает; zero = нет
 
-	lastDrawn    string    // ключ последнего нарисованного статичного кадра
-	lastAnimDraw time.Time // время последнего анимационного кадра (прореживание)
+	lastDrawn       string    // ключ последнего нарисованного статичного кадра
+	lastAnimDraw    time.Time // время последнего анимационного кадра (прореживание)
+	pendingConfirm  bool      // после анимации статичный кадр перерисовать ещё раз
 
 	// DMA-буферы: выделяются один раз и живут вечно — их физические
 	// страницы не возвращаются ядру и не переиспользуются, что исключает
@@ -288,12 +290,14 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 		for i := range px {
 			px[i] = mul(c, dim)
 		}
-		return "solid", px, false
+		// dim в ключе: иначе SetScale на статичной сцене скипается дедупом
+		// (lastDrawn совпадёт, кадр с новой яркостью не уйдёт).
+		return fmt.Sprintf("solid@%.2f", dim), px, false
 	case "muted":
 		for i := range px {
 			px[i] = mul(MUTED_RGB, dim)
 		}
-		return "muted", px, false
+		return fmt.Sprintf("muted@%.2f", dim), px, false
 	case "error":
 		on := now.UnixMilli()%int64(blinkPeriod) < int64(blinkPeriod)/2
 		for i := range px {
@@ -332,9 +336,18 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 // Анимации рисуются не чаще animFps: каждый кадр = rebind контроллера,
 // а частый rebind портит память ядра (UAF в bind/unbind spidev, см.
 // ~/marusia-serial.log Oops 2026-11-06). Только в акторе.
+//
+// Страховка от сбитого финального кадра: WS2812 — сдвиговая цепочка, и
+// редкий сбой бита на шине (каждый кадр = unbind/bind) защёлкивает мусор
+// в хвосте кольца, причём демон уверен, что кадр ушёл чисто, и дедупом
+// больше не перерисовывает (наблюдалось: часть кольца не гаснет после
+// вспышки громкости). Поэтому первый статичный кадр после анимации
+// (pendingConfirm) рисуется ещё раз на следующем тике — один лишний
+// rebind на смену сцены, остаток живёт ≤80 мс вместо «до следующего
+// события».
 func (r *Ring) render(now time.Time) {
 	key, px, animated := r.frame(now)
-	if !animated && key == r.lastDrawn {
+	if !animated && key == r.lastDrawn && !r.pendingConfirm {
 		return // статичный кадр уже на диодах
 	}
 	if animated && now.Sub(r.lastAnimDraw) < animFrameInterval {
@@ -350,6 +363,7 @@ func (r *Ring) render(now time.Time) {
 		r.lastAnimDraw = now
 		r.lastDrawn = "" // после анимации статичную сцену перерисовать
 	} else {
+		r.pendingConfirm = r.lastDrawn == "" // первый статичный после анимации → подтвердить повтором
 		r.lastDrawn = key
 	}
 }

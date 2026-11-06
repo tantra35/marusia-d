@@ -2,6 +2,7 @@ package ring
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,11 +56,39 @@ func TestFrameMuted(t *testing.T) {
 	r.scale = 1
 
 	key, px, animated := r.frame(time.Now())
-	if key != "muted" || animated {
+	// dim входит в ключ (иначе SetScale скипается дедупом) — проверяем префикс.
+	if !strings.HasPrefix(key, "muted@") || animated {
 		t.Fatalf("key = %q animated = %v, want muted без анимации", key, animated)
 	}
 	if px[0] != MUTED_RGB {
 		t.Fatalf("px[0] = %v, want приглушённый красный %v", px[0], MUTED_RGB)
+	}
+}
+
+// TestStaticKeyIncludesScale — смена scale на статичной сцене обязана менять
+// ключ кадра: иначе render() скипает по lastDrawn и новая яркость от датчика
+// света не доедет до диодов (регрессия: ключ был голым "solid"/"muted").
+func TestStaticKeyIncludesScale(t *testing.T) {
+	r := New("/dev/null", 12)
+	r.haActive = true
+	r.solid = Color{255, 255, 255}
+	r.scale = 1
+
+	key1, _, _ := r.frame(time.Now())
+	r.scale = 0.2
+	key2, _, _ := r.frame(time.Now())
+	if key1 == key2 {
+		t.Fatalf("ключ solid не изменился при смене scale (%q), дедуп скипал бы кадр", key1)
+	}
+
+	r.haActive = false
+	r.muted = true
+	r.scale = 1
+	key3, _, _ := r.frame(time.Now())
+	r.scale = 0.2
+	key4, _, _ := r.frame(time.Now())
+	if key3 == key4 {
+		t.Fatalf("ключ muted не изменился при смене scale (%q), дедуп скипал бы кадр", key3)
 	}
 }
 
