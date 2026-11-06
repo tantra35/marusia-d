@@ -378,9 +378,9 @@ func (r *Ring) Serve(ctx context.Context) {
 			}
 			return
 		case cmd := <-r.cmdCh:
-			r.exec(&cmd)         // 1. состояние
+			v := r.exec(&cmd)    // 1. состояние (запросы значения — возвращают его)
 			r.render(time.Now()) // 2. кадр
-			cmd.reply <- nil     // 3. подтверждение
+			cmd.reply <- v       // 3. подтверждение (сеттеры) / ответ (cmdGetMuted)
 		case <-tick.C:
 			r.render(time.Now())
 		}

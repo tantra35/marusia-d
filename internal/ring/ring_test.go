@@ -105,3 +105,21 @@ func TestScaleClamp(t *testing.T) {
 		t.Fatalf("scale = %v, want 1 (кламп сверху)", r.scale)
 	}
 }
+
+// TestMutedGetter — Muted() возвращает значение (регрессия: Serve шлёт
+// в reply всегда nil → type assertion паниковал; ловилось на KEY_MUTE).
+func TestMutedGetter(t *testing.T) {
+	r := New("/dev/null", 12)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Serve(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	if r.Muted() {
+		t.Fatal("Muted() = true, want false до мьюта")
+	}
+	r.SetMuted(true)
+	if !r.Muted() {
+		t.Fatal("Muted() = false, want true после SetMuted(true)")
+	}
+}
