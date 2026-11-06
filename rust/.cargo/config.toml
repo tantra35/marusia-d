@@ -1,0 +1,4 @@
+# Статический musl-бинарь под колонку: линкуем bundled lld
+# (системный bfd не знает --fix-cortex-a53-843419).
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
