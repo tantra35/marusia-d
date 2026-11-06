@@ -280,17 +280,18 @@ func main() {
 		}
 		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 	}
-	// громкость через API (DLNA/HA → mpd setvol → событие mixer): mpd сам
-	// уже применил громкость (hardware-микшер pulse-выхода крутит наш sink),
-	// наш отклик — только индикация, не чаще раза в 0.7 с (слайдер
-	// генерирует много setvol подряд).
+	// громкость через API (DLNA/HA → mpd setvol → событие mixer). Протокол
+	// MPD ограничен setvol 0..100 — масштабируем в нашу шкалу 0..150:
+	// слайдер на максимуме = реальные 150% на sink (как кнопки).
 	var lastVolNotify time.Time
 	mpdLink.onVolume = func(pct int) {
 		if time.Since(lastVolNotify) < 700*time.Millisecond {
 			return
 		}
 		lastVolNotify = time.Now()
-		volFeedback(pct * VOLUME_MAX_PCT / 100)
+		scaled := pct * VOLUME_MAX_PCT / 100
+		setSinkPct(scaled)
+		volFeedback(scaled)
 	}
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
