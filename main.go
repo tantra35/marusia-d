@@ -275,8 +275,8 @@ func main() {
 		if p < 0 {
 			p = 0
 		}
-		if p > 100 {
-			p = 100
+		if p > VOLUME_MAX_PCT {
+			p = VOLUME_MAX_PCT
 		}
 		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 	}
@@ -290,7 +290,7 @@ func main() {
 			return
 		}
 		lastVolNotify = time.Now()
-		volFeedback(pct)
+		volFeedback(pct * VOLUME_MAX_PCT / 100)
 	}
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
