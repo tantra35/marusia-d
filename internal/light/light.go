@@ -25,6 +25,18 @@ func Start(ctx context.Context, interval time.Duration) <-chan float64 {
 		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
+		// Окно света у колонки слабое: комната 0.02..3.2 lux (замер
+		// 2026-11-06). Дефолт x1 даёт 1.3 lux на отсчёт — темнота и лампы
+		// слипаются в 0..2 отсчёта. x128 + интеграция 688 мс = 0.001 lux
+		// на отсчёт (шум ±0.01). Лучшее усилие: без этого датчик почти слеп.
+		for _, s := range [][2]string{
+			{"hardwaregain", "128"},
+			{"integration_time", "0.688296"},
+		} {
+			if err := os.WriteFile(filepath.Join(dir, s[0]), []byte(s[1]), 0o644); err != nil {
+				log.Printf("light: %s: %v", s[0], err)
+			}
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -60,10 +72,11 @@ func findBH1730() string {
 }
 
 // Scale — lux → множитель яркости кольца 0.15..1.0
-// (в темноте приглушаем, при 300+ лк — полный ход). Без гистерезиса:
-// EMA в main сглаживает скачки.
+// (в темноте приглушаем, при 3+ лк — полный ход). Пороги под фактический
+// диапазон окна: ночь ~0.02, лампы ~3.2 (замер 2026-11-06, x128).
+// Без гистерезиса: EMA в main сглаживает скачки.
 func Scale(lux float64) float64 {
-	const lo, hi = 5.0, 300.0
+	const lo, hi = 0.3, 3.0
 	switch {
 	case lux <= lo:
 		return 0.15
@@ -77,7 +90,7 @@ func Scale(lux float64) float64 {
 // ClockPWM — lux → яркость панели-часов 0..255. Как Scale, но минимум
 // глубже (12/255): ночью часы не должны светить в потолок.
 func ClockPWM(lux float64) int {
-	const lo, hi, loPWM, hiPWM = 5.0, 300.0, 12, 255
+	const lo, hi, loPWM, hiPWM = 0.3, 3.0, 12, 255
 	switch {
 	case lux <= lo:
 		return loPWM
@@ -90,13 +103,14 @@ func ClockPWM(lux float64) int {
 
 // ClockCurrent — lux → current_divider 1..4 (1 ярче всего, 4 — ночной режим).
 // Токовые ступени режут ток LED сами по себе, независимо от PWM.
+// Пороги под фактический диапазон окна (ночь ~0.02, лампы ~3.2).
 func ClockCurrent(lux float64) int {
 	switch {
-	case lux >= 100:
+	case lux >= 2.0:
 		return 1
-	case lux >= 20:
+	case lux >= 1.0:
 		return 2
-	case lux >= 5:
+	case lux >= 0.3:
 		return 3
 	default:
 		return 4

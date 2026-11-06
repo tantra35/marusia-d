@@ -282,13 +282,32 @@ func (c *Clock) Off() error {
 	return c.Colon(false)
 }
 
-// SetBrightness — PWM 0..255 на панель.
+// SetBrightness — PWM 0..255 на панель. Двоеточие — отдельный LED, PWM
+// родителя его не накрывает (vendor clockdisp тоже пишет его абсолютным
+// значением): после смены яркости синхронизируем, иначе оно отстаёт до
+// следующей перерисовки минутного тика (ловилось: цифры яркие —
+// двоеточие тусклое).
 func (c *Clock) SetBrightness(v byte) error {
 	if c.brightFile == "" {
 		return fmt.Errorf("нет файла яркости")
 	}
 	c.bright = v
-	return writeStr(c.brightFile, fmt.Sprint(v))
+	if err := writeStr(c.brightFile, fmt.Sprint(v)); err != nil {
+		return err
+	}
+	return c.resyncColon()
+}
+
+// resyncColon — поднять двоеточие до текущей яркости, если оно горит.
+func (c *Clock) resyncColon() error {
+	if c.colonTop == "" {
+		return nil
+	}
+	b, err := os.ReadFile(c.colonTop)
+	if err != nil || strings.TrimSpace(string(b)) == "0" {
+		return nil // выключено — не включаем
+	}
+	return c.Colon(true)
 }
 
 // SetCurrent — аналоговый ток 1..4 (1 ярче всего; 4 — тихий режим).
