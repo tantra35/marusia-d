@@ -72,6 +72,10 @@ type mpdLink struct {
 	// onVolume — колбэк «громкость изменилась через API (DLNA/HA/mpd-клиент)»:
 	// вотчер ловит idle-событие mixer и передаёт процент 0..100.
 	onVolume func(int)
+	// lastVol — последняя известная громкость для дедупа: пауза/плей
+	// переоткрывают pulse-вывод и дёргают событие mixer без смены громкости.
+	// -1 = ещё не известно (первое чтение молча запоминается).
+	lastVol int
 }
 
 // Serve — цикл переподключения к mpd: коннект → статус/watch → при обрыве
@@ -149,13 +153,20 @@ func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
 				// громкость сменилась через API (DLNA/HA → mpd setvol):
 				// прокинуть в демона — отклик (вспышка кольца, панель).
 				// Sink демон здесь НЕ трогает: масштаб 0..100 → 0..150
-				// делает сам mpd (scale_volume в mpd.conf).
+				// делает сам mpd (scale_volume в mpd.conf). На паузе/плей
+				// pulse-вывод переоткрывается и событие mixer приходит
+				// БЕЗ смены громкости (а на паузе volume вообще
+				// исчезает из status) — реагируем только на изменение.
 				if m.onVolume == nil {
 					break
 				}
 				if st, err := c.Status(); err == nil {
-					if v, err := strconv.Atoi(st["volume"]); err == nil {
-						m.onVolume(v)
+					if v, err := strconv.Atoi(st["volume"]); err == nil && v != m.lastVol {
+						first := m.lastVol < 0
+						m.lastVol = v
+						if !first {
+							m.onVolume(v)
+						}
 					}
 				}
 			}
@@ -225,7 +236,7 @@ func main() {
 	}()
 
 	// ---------- mpd ----------
-	mpdLink := &mpdLink{addr: *mpdAddr, statesCh: make(chan string, 8)}
+	mpdLink := &mpdLink{addr: *mpdAddr, statesCh: make(chan string, 8), lastVol: -1}
 	go mpdLink.Serve(ctx)
 
 	// ---------- LVA (периферийный API) ----------
