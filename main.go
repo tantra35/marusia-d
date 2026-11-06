@@ -69,6 +69,9 @@ type mpdLink struct {
 	mu       sync.Mutex
 	conn     *mpd.Client
 	statesCh chan string
+	// onVolume — колбэк «громкость изменилась через API (DLNA/HA/mpd-клиент)»:
+	// вотчер ловит idle-событие mixer и передаёт процент 0..100.
+	onVolume func(int)
 }
 
 // Serve — цикл переподключения к mpd: коннект → статус/watch → при обрыве
@@ -137,9 +140,21 @@ func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
 			log.Printf("mpd watcher: %v", err)
 			return
 		case ev := <-w.Event:
-			if ev == "player" || ev == "mixer" {
+			switch ev {
+			case "player":
 				if st, err := c.Status(); err == nil {
 					m.statesCh <- st["state"]
+				}
+			case "mixer":
+				// громкость сменилась через API (DLNA/HA → mpd setvol):
+				// прокинуть в демона — sink, вспышка кольца, панель
+				if m.onVolume == nil {
+					break
+				}
+				if st, err := c.Status(); err == nil {
+					if v, err := strconv.Atoi(st["volume"]); err == nil {
+						m.onVolume(v)
+					}
 				}
 			}
 		case <-ping.C:
@@ -264,6 +279,23 @@ func main() {
 			p = 100
 		}
 		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
+	}
+	// громкость через API (DLNA/HA → mpd setvol → событие mixer): mpd сам
+	// уже применил громкость (hardware-микшер pulse-выхода крутит наш sink),
+	// наш отклик — только индикация, не чаще раза в 0.7 с (слайдер
+	// генерирует много setvol подряд).
+	var lastVolNotify time.Time
+	mpdLink.onVolume = func(pct int) {
+		if time.Since(lastVolNotify) < 700*time.Millisecond {
+			return
+		}
+		lastVolNotify = time.Now()
+		setSinkPct(pct) // страховка: идемпотентно повторить за mpd
+		playSound(SOUND_VOLUME)
+		rg.Flash(volumeColor(pct), FLASH_MS)
+		if clk != nil {
+			clk.ShowVolume(pct)
+		}
 	}
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
@@ -490,8 +522,10 @@ func pactlOutput(args ...string) (string, error) {
 }
 
 // volumeColor — цвет вспышки громкости, двухсегментный градиент:
-//   0..половины — синий → зелёный (B убывает, G растёт);
-//   половина..максимума — зелёный → оранжевый (R растёт, G спадает до 140).
+//
+//	0..половины — синий → зелёный (B убывает, G растёт);
+//	половина..максимума — зелёный → оранжевый (R растёт, G спадает до 140).
+//
 // pct=-1 — уровень не узнали: белая.
 func volumeColor(pct int) ring.Color {
 	if pct < 0 {
