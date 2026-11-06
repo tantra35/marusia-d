@@ -290,12 +290,7 @@ func main() {
 			return
 		}
 		lastVolNotify = time.Now()
-		setSinkPct(pct) // страховка: идемпотентно повторить за mpd
-		playSound(SOUND_VOLUME)
-		rg.Flash(volumeColor(pct), FLASH_MS)
-		if clk != nil {
-			clk.ShowVolume(pct)
-		}
+		volFeedback(pct)
 	}
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
