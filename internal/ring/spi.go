@@ -2,13 +2,18 @@ package ring
 
 // SPI-транспорт кольца: rebind контроллера + отправка кадра через spidev.
 //
-// Зависимости от железа (экспериментально проверено 2026-11-06, живая полоса):
+// Зависимости от железа (экспериментально проверено 2026-11-06/07, живая полоса):
 //   - бит → 4 SPI-бита: 0 → 1000b, 1 → 1100b («1»=1110 даёт high 0.9 мкс —
 //     вне спекции WS2812 и декодируется полосой нестабильно);
 //   - каналы внутри диода в порядке байт, как шлём (для RGB-цвета — G,R,B);
 //   - кадр = 128 reset + 144 байта (12 диодов × 12 байт) + 128 reset = 400;
-//   - speed 3 346 144 Гц, bits_per_word=8 (64-битный DMA переставляет байты
-//     внутри слов — каналы скачмаплены);
+//   - speed 3 346 144 Гц, bits_per_word=64 = DMA-режим (как у vendor ringled):
+//     DMA передаёт слово старшим байтом вперёд — компенсируем реверсом
+//     каждого 8-байтного слова в буфере (encodeFrameInto).
+//     НЕ bits=8: PIO-режим рвёт кадр каждые 16 байт (FIFO не успевает),
+//     разрывы на проводе защёлкивают мусор в хвосте цепочки — «сектор
+//     кольца не гаснет после вспышки» (vendor-путь на 40 циклах чист,
+//     наш bits=8 — нет; A/B 2026-11-07);
 //   - rebind контроллера (unbind/bind) перед КАЖДЫМ кадром: делитель SPI
 //     корректен только после probe, мульти-кадровые сессии не живут.
 //
@@ -49,9 +54,11 @@ func encodeByte(b byte) [4]byte {
 }
 
 // encodeFrameInto — собрать кадр в БУФЕР ДМА (dst[:0]): reset + GRB-пиксели
-// + reset. Буфер передаётся постоянный (Ring.frameBuf): его физические
-// страницы не возвращаются ядру между кадрами, и cache-sync при unmap
-// всегда падает на наши же данные.
+// + reset, затем реверс каждого 8-байтного слова: DMA spicc гонит слово
+// старшим байтом вперёд, без реверса каналы перемешиваются (vendor-схема
+// ringled). 400 байт = ровно 50 слов. Буфер передаётся постоянный
+// (Ring.frameBuf): его физические страницы не возвращаются ядру между
+// кадрами, и cache-sync при unmap всегда падает на наши же данные.
 func encodeFrameInto(dst []byte, px [leds][3]byte) []byte {
 	dst = dst[:0]
 	dst = append(dst, make([]byte, resetLen)...)
@@ -64,6 +71,11 @@ func encodeFrameInto(dst []byte, px [leds][3]byte) []byte {
 	dst = append(dst, make([]byte, resetLen)...)
 	if len(dst) != frameLen {
 		panic(fmt.Sprintf("кадр %d байт, ожидалось %d", len(dst), frameLen))
+	}
+	for i := 0; i+8 <= len(dst); i += 8 { // реверс 64-битных слов
+		for j := 0; j < 4; j++ {
+			dst[i+j], dst[i+7-j] = dst[i+7-j], dst[i+j]
+		}
 	}
 	return dst
 }
@@ -107,8 +119,8 @@ func (r *Ring) draw() error {
 	defer f.Close()
 
 	tx := []spiXfer{
-		{txBuf: uint64(uintptr(unsafe.Pointer(&r.primeBuf[0]))), len: primeLen, speed: primeHz, bits: 8},
-		{txBuf: uint64(uintptr(unsafe.Pointer(&r.frameBuf[0]))), len: uint32(len(r.frameBuf)), speed: frameHz, bits: 8},
+		{txBuf: uint64(uintptr(unsafe.Pointer(&r.primeBuf[0]))), len: primeLen, speed: primeHz, bits: 64},
+		{txBuf: uint64(uintptr(unsafe.Pointer(&r.frameBuf[0]))), len: uint32(len(r.frameBuf)), speed: frameHz, bits: 64},
 	}
 	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocMessage(len(tx)), uintptr(unsafe.Pointer(&tx[0]))); e != 0 {
 		return fmt.Errorf("SPI_IOC_MESSAGE: %w", e)
