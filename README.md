@@ -9,7 +9,7 @@
 |---|---|---|
 | Кольцо | 12× WS2812-подобных, SPI0 | `/dev/spidev0.0`, 3.35 МГц, 4 SPI-бита на бит WS2812 (0→1000, 1→1110), GRB, reset 128 байт ≈300 мкс |
 | Сенсоры | Hynitron CSK05T, I2C @0x15 | evdev `/dev/input/event0`, keycodes 114, 115, 248, 148, 582 (из DT keys@15) |
-| Панель-часы | IS31FL3236A, I2C @0x3C | seg-led класс: `linedisp.*/message`, `map_seg7` (маски через коды 0x01–0x04), colon = leds, яркость на родителе, `current_divider` 1–4 |
+| Панель-часы | IS31FL3236A, I2C @0x3C | seg-led класс: `linedisp.*/message`, `map_seg7` (глифы лиц в 'a'..'h', один раз на старте), colon = leds, яркость на родителе, `current_divider` 1–4 |
 | Датчик света | Rohm BH1730, I2C @0x29 | IIO `in_illuminance_input` → множитель яркости кольца 0.15–1.0 |
 
 ## Логика

@@ -1,7 +1,8 @@
 // Package clock — передняя панель VK Mini: 4×7-сегментных цифры + двоеточие
 // на IS31FL3236A (I2C 0x3C), через кастомный seg-led класс ядра.
 // Логика повторяет vendor-скрипт clockdisp: текст — запись в linedisp/message,
-// произвольные маски сегментов — патч 4 управляющих кодов в map_seg7,
+// произвольные маски сегментов — глифы в map_seg7 ('a'..'h',
+// вписываются один раз),
 // двоеточие — обычные leds (clock:colon:top/bottom).
 //
 // Архитектура — АКТОР (как ring.Ring): единственная горутина Serve владеет
@@ -14,7 +15,8 @@
 //
 // Горячие пути — БЕЗ аллокаций: дедуп минуты по Unix()/60 (не Format),
 // поля и числа собираются в переиспользуемые буферы актора (fieldBuf/
-// numBuf), map_seg7 кэшируется один раз и патчится на месте.
+// numBuf); map_seg7 читается один раз (регистрация глифов), кадр лица —
+// одна запись 4 байт в message.
 package clock
 
 import (
@@ -30,17 +32,6 @@ import (
 
 // Masks сегментов: a=0x01 b=0x02 c=0x04 d=0x08 e=0x10 f=0x20 g=0x40
 // (порядок бит из map_to_7segment.h, как в clockdisp).
-const (
-	EyeArch   = 0x23 // a b f — открытый глаз, покой
-	EyeLine   = 0x40 // g     — прищур
-	EyeLow    = 0x08 // d     — сонный
-	EyeHigh   = 0x01 // a     — поднятая бровь
-	EyeWide   = 0x3f // 0     — широко
-	EyeRound  = 0x5c // o     — маленький круглый
-	AngryEyeL = 0x21 // a f   — бровь к носу
-	AngryEyeR = 0x03 // a b   — зеркало
-	blank     = 0x00
-)
 
 const (
 	VOLUME_SHOW_MS = 1500 * time.Millisecond // сколько на панели держатся проценты громкости
@@ -74,10 +65,22 @@ const (
 	modeVolume              // проценты громкости
 )
 
-// maskCodes — 4 неиспользуемых управляющих кода map_seg7, которые патчит
-// showMasks (пакетная переменная: пишется в sysfs каждый шаг лица —
-// конверсия строки в []byte на каждом вызове исключена).
-var maskCodes = [4]byte{0x01, 0x02, 0x03, 0x04}
+// Глифы лиц: GLYPH_MASKS — буква → маска сегментов. Буква и есть код в
+// map_seg7 (ASCII), маски вписываются в таблицу ОДИН раз под эти коды.
+// Буквы выбраны из символов, которые часы никогда не печатают (текст —
+// только '0'..'9' и пробел), поэтому обычный вывод времени не затрагивается.
+// Кадр лица — одна запись 4 байт в message (' ' + буква + буква + ' ';
+// пробел в дефолтной таблице = пустая цифра).
+var GLYPH_MASKS = map[byte]byte{
+	'a': 0x23, // a b f — открытый глаз, покой
+	'b': 0x40, // g     — прищур
+	'c': 0x08, // d     — сонный
+	'd': 0x01, // a     — поднятая бровь
+	'e': 0x3f, // 0     — широко
+	'f': 0x5c, // o     — маленький круглый
+	'g': 0x21, // a f   — бровь к носу
+	'h': 0x03, // a b   — зеркало
+}
 
 // zeroDigit — «0» для выключения LED (writeBytes, без конверсии строки).
 var zeroDigit = [1]byte{'0'}
@@ -102,18 +105,18 @@ type Clock struct {
 	volPct      int       // modeVolume: какие проценты рисовать
 	volDrawn    bool      // modeVolume: проценты уже на панели
 	volUntil    time.Time // modeVolume: когда вернуть часы
-	cur         int       // current_divider 1..4 (на панель попадёт update'ом)
-	brightDirty bool      // яркость изменилась — update перезапишет
-	curDirty    bool      // current изменился — update перезапишет
+	cur         int       // current_divider 1..4 (на панель попадёт render'ом)
+	brightDirty bool      // яркость изменилась — render перезапишет
+	curDirty    bool      // current изменился — render перезапишет
 
 	// дедуп минут без аллокаций: номер минуты Unix()/60; −1 = ещё не рисовали
 	lastMinBucket int64
 
 	// буферы актора (переиспользуются, ноль аллокаций на запись):
-	segMap   [128]byte // кэш map_seg7: читается один раз, патчится на месте
-	segHave  bool
-	fieldBuf [4]byte // выравненное поле 4 символов для message
-	numBuf   [8]byte // числовые значения (яркость/ток/громкость) для sysfs
+	segMap   [128]byte // кэш map_seg7: читается один раз (регистрация глифов)
+	segHave  bool      // глифы уже вписаны в таблицу
+	fieldBuf [4]byte   // выравненное поле 4 символов для message
+	numBuf   [8]byte   // числовые значения (яркость/ток/громкость) для sysfs
 }
 
 func Open() (*Clock, error) {
@@ -208,7 +211,7 @@ func (c *Clock) Serve(ctx context.Context) {
 	tick := time.NewTicker(updateInterval)
 	defer tick.Stop()
 
-	c.lastMinBucket = -1 // −1 → первый update нарисует часы
+	c.lastMinBucket = -1 // −1 → первый render нарисует часы
 	for {
 		select {
 		case <-ctx.Done():
@@ -217,15 +220,15 @@ func (c *Clock) Serve(ctx context.Context) {
 			return
 		case cmd := <-c.cmdCh:
 			c.exec(cmd)
-			c.update(time.Now())
+			c.render(time.Now())
 		case <-tick.C:
-			c.update(time.Now())
+			c.render(time.Now())
 		}
 	}
 }
 
 // exec — исполнить команду внутри актора: ТОЛЬКО поменять состояние,
-// ничего не писать. Единственный писатель — update(); Serve вызывает его
+// ничего не писать. Единственный писатель — render(); Serve вызывает его
 // сразу после exec, поэтому задержки отображения команда не добавляет.
 func (c *Clock) exec(cmd clockCmd) {
 	switch cmd.kind {
@@ -233,7 +236,7 @@ func (c *Clock) exec(cmd clockCmd) {
 		c.mode = modeFaces
 		c.faces = cmd.faces
 		c.faceIdx = 0
-		c.faceNext = time.Time{} // нулевое время → update нарисует сразу
+		c.faceNext = time.Time{} // нулевое время → render нарисует сразу
 	case cmdShowVolume:
 		c.mode = modeVolume
 		c.volPct = cmd.pct
@@ -252,12 +255,12 @@ func (c *Clock) exec(cmd clockCmd) {
 	}
 }
 
-// update — шаг состояния панели в момент now и ЕДИНСТВЕННАЯ точка записи
+// render — шаг состояния панели в момент now и ЕДИНСТВЕННАЯ точка записи
 // в sysfs: сперва доводит до устройства отложенные команды (яркость, ток),
 // затем рисует то, что должно быть на панели (лица / проценты / часы).
-// В отличие от ring.render, кадр каждый тик не строится — запись только
-// при смене содержимого.
-func (c *Clock) update(now time.Time) {
+// В отличие от ring.render, кадр строится не каждый тик — запись только
+// при смене содержимого (дедуп минутой, volDrawn, faceNext).
+func (c *Clock) render(now time.Time) {
 	if c.brightDirty {
 		c.brightDirty = false
 		if err := c.writeBrightness(); err != nil {
@@ -310,7 +313,7 @@ func (c *Clock) update(now time.Time) {
 
 // writeBrightness — PWM на панель; горящее двоеточие синхронизируется
 // (оно — отдельный LED, PWM родителя его не накрывает: ловилось «цифры
-// яркие — двоеточие тусклое»). Только из update.
+// яркие — двоеточие тусклое»). Только из render.
 func (c *Clock) writeBrightness() error {
 	if c.brightFile == "" {
 		return fmt.Errorf("нет файла яркости")
@@ -321,7 +324,7 @@ func (c *Clock) writeBrightness() error {
 	return c.resyncColon()
 }
 
-// writeCurrent — аналоговый ток 1..4. Только из update.
+// writeCurrent — аналоговый ток 1..4. Только из render.
 func (c *Clock) writeCurrent() error {
 	if c.curDiv == "" {
 		return fmt.Errorf("нет current_divider")
@@ -366,35 +369,46 @@ func (c *Clock) writeText(b []byte, colon bool) error {
 	return c.colon(colon)
 }
 
-// showMasks — произвольные маски на 4 цифры: патчим 4 неиспользуемых
-// управляющих кода (0x01..0x04) в map_seg7 и печатаем их. map_seg7
-// читается ОДИН раз в segMap, дальше — патч на месте (чтение 128 Б
-// os.ReadFile на каждом шаге лица — была самая жирная аллокация анимаций).
-func (c *Clock) showMasks(m [4]byte) error {
-	if !c.segHave {
-		raw, err := os.ReadFile(c.mapSeg)
-		if err != nil || len(raw) != 128 {
-			return fmt.Errorf("map_seg7: нужно ровно 128 байт, %v", err)
-		}
-		copy(c.segMap[:], raw)
-		c.segHave = true
+// registerGlyphs — ОДИН раз вписать маски глаз в map_seg7 под их буквы
+// (ключ GLYPH_MASKS = ASCII-код ячейки таблицы). Таблица читается в segMap
+// кэш, патчится только в этих 8 слотах и пишется обратно целиком;
+// повторные вызовы — no-op. Порядок обхода map не важен: каждый ключ
+// пишет свою ячейку. Только из Serve (единственный писатель).
+func (c *Clock) registerGlyphs() error {
+	if c.segHave {
+		return nil
 	}
-	for i, v := range m {
-		c.segMap[1+i] = v
+	raw, err := os.ReadFile(c.mapSeg)
+	if err != nil || len(raw) != 128 {
+		return fmt.Errorf("map_seg7: нужно ровно 128 байт, %v", err)
+	}
+	copy(c.segMap[:], raw)
+	for code, m := range GLYPH_MASKS {
+		c.segMap[code] = m
 	}
 	if err := writeBytes(c.mapSeg, c.segMap[:]); err != nil {
 		return err
 	}
-	return writeBytes(c.message, maskCodes[:])
+	c.segHave = true
+	return nil
 }
 
-// face — лицо из clockdisp: два глаза на средних цифрах, нос — нижняя точка.
+// face — лицо из clockdisp: два глаза на средних цифрах, нос — нижняя
+// точка. Кадр — одна запись 4 байт в message, таблица не трогается.
 func (c *Clock) face(name string) error {
+	if err := c.registerGlyphs(); err != nil {
+		return err
+	}
 	l, r, ok := faceEyes(name)
 	if !ok {
 		return fmt.Errorf("нет лица %q", name)
 	}
-	if err := c.showMasks([4]byte{blank, l, r, blank}); err != nil {
+	f := c.fieldBuf[:]
+	f[0] = ' '
+	f[1] = l
+	f[2] = r
+	f[3] = ' '
+	if err := writeBytes(c.message, f); err != nil {
 		return err
 	}
 	if c.colonTop != "" && c.colonBot != "" {
@@ -456,24 +470,25 @@ func (c *Clock) resyncColon() error {
 	return c.colon(true)
 }
 
+// faceEyes — буквы-глифы для лица: два глаза из GLYPH_MASKS.
 func faceEyes(name string) (byte, byte, bool) {
 	switch name {
 	case "idle":
-		return EyeArch, EyeArch, true
+		return 'a', 'a', true
 	case "neutral":
-		return EyeLine, EyeLine, true
+		return 'b', 'b', true
 	case "surprised":
-		return EyeWide, EyeWide, true
+		return 'e', 'e', true
 	case "curious":
-		return EyeRound, EyeRound, true
+		return 'f', 'f', true
 	case "sleepy":
-		return EyeLow, EyeLow, true
+		return 'c', 'c', true
 	case "shock":
-		return EyeHigh, EyeHigh, true
+		return 'd', 'd', true
 	case "wink":
-		return EyeArch, EyeLine, true
+		return 'a', 'b', true
 	case "angry":
-		return AngryEyeL, AngryEyeR, true
+		return 'g', 'h', true
 	}
 	return 0, 0, false
 }
