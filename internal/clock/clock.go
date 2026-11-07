@@ -82,12 +82,17 @@ type Clock struct {
 	bright     byte
 	cmdCh      chan clockCmd
 
-	mode       modeT     // текущий режим панели
-	faces      []string  // modeFaces: очередь лиц
-	faceIdx    int       // modeFaces: индекс следующего лица
-	faceNext   time.Time // modeFaces: когда рисовать следующее лицо
-	volUntil   time.Time // modeVolume: когда вернуть часы
-	lastMinute string    // последняя нарисованная минута «15:04» (дедуп)
+	mode        modeT     // текущий режим панели
+	faces       []string  // modeFaces: очередь лиц
+	faceIdx     int       // modeFaces: индекс следующего лица
+	faceNext    time.Time // modeFaces: когда рисовать следующее лицо
+	volPct      int       // modeVolume: какие проценты рисовать
+	volDrawn    bool      // modeVolume: проценты уже на панели
+	volUntil    time.Time // modeVolume: когда вернуть часы
+	cur         int       // current_divider 1..4 (на панель попадёт update'ом)
+	brightDirty bool      // яркость изменилась — update перезапишет
+	curDirty    bool      // current изменился — update перезапишет
+	lastMinute  string    // последняя нарисованная минута «15:04» (дедуп)
 }
 
 func Open() (*Clock, error) {
@@ -182,8 +187,7 @@ func (c *Clock) Serve(ctx context.Context) {
 	tick := time.NewTicker(updateInterval)
 	defer tick.Stop()
 
-	c.lastMinute = time.Now().Format("15:04")
-	c.showTime()
+	c.lastMinute = "" // пустая минута → первый update нарисует часы
 	for {
 		select {
 		case <-ctx.Done():
@@ -199,9 +203,9 @@ func (c *Clock) Serve(ctx context.Context) {
 	}
 }
 
-// exec — исполнить команду внутри актора: поменять режим/состояние и при
-// необходимости немедленно написать содержимое. Отложенные кадры
-// дорисовывает update().
+// exec — исполнить команду внутри актора: ТОЛЬКО поменять состояние,
+// ничего не писать. Единственный писатель — update(); Serve вызывает его
+// сразу после exec, поэтому задержки отображения команда не добавляет.
 func (c *Clock) exec(cmd clockCmd) {
 	switch cmd.kind {
 	case cmdPlayFaces:
@@ -210,43 +214,41 @@ func (c *Clock) exec(cmd clockCmd) {
 		c.faceIdx = 0
 		c.faceNext = time.Time{} // нулевое время → update нарисует сразу
 	case cmdShowVolume:
-		if err := c.setText(fmt.Sprintf("%d", cmd.pct)); err != nil {
-			log.Printf("clock: громкость %d: %v", cmd.pct, err)
-			return
-		}
 		c.mode = modeVolume
+		c.volPct = cmd.pct
+		c.volDrawn = false
 		c.volUntil = time.Now().Add(VOLUME_SHOW_MS)
 	case cmdSetBrightness:
-		if c.brightFile == "" {
-			log.Printf("clock: яркость %d: нет файла яркости", cmd.val)
-			return
-		}
 		c.bright = byte(cmd.val)
-		if err := writeStr(c.brightFile, fmt.Sprint(cmd.val)); err != nil {
-			log.Printf("clock: яркость %d: %v", cmd.val, err)
-			return
-		}
-		c.resyncColon()
+		c.brightDirty = true
 	case cmdSetCurrent:
-		if c.curDiv == "" {
-			log.Printf("clock: current %d: нет current_divider", cmd.val)
-			return
-		}
 		if cmd.val < 1 || cmd.val > 4 {
 			log.Printf("clock: current %d: допустимо 1..4", cmd.val)
 			return
 		}
-		if err := writeStr(c.curDiv, fmt.Sprint(cmd.val)); err != nil {
-			log.Printf("clock: current %d: %v", cmd.val, err)
-		}
+		c.cur = cmd.val
+		c.curDirty = true
 	}
 }
 
-// update — шаг состояния панели в момент now: двигает анимацию лиц,
-// возвращает часы по истечении громкости, перерисовывает время при смене
-// минуты. «Рисует» (пишет в sysfs) только при смене содержимого — в
-// отличие от ring.render, кадр каждый тик не строится.
+// update — шаг состояния панели в момент now и ЕДИНСТВЕННАЯ точка записи
+// в sysfs: сперва доводит до устройства отложенные команды (яркость, ток),
+// затем рисует то, что должно быть на панели (лица / проценты / часы).
+// В отличие от ring.render, кадр каждый тик не строится — запись только
+// при смене содержимого.
 func (c *Clock) update(now time.Time) {
+	if c.brightDirty {
+		c.brightDirty = false
+		if err := c.writeBrightness(); err != nil {
+			log.Printf("clock: яркость %d: %v", c.bright, err)
+		}
+	}
+	if c.curDirty {
+		c.curDirty = false
+		if err := c.writeCurrent(); err != nil {
+			log.Printf("clock: current %d: %v", c.cur, err)
+		}
+	}
 	switch c.mode {
 	case modeFaces:
 		if now.Before(c.faceNext) {
@@ -266,6 +268,14 @@ func (c *Clock) update(now time.Time) {
 		}
 	case modeVolume:
 		if now.Before(c.volUntil) {
+			if !c.volDrawn {
+				if err := c.setText(fmt.Sprintf("%d", c.volPct)); err != nil {
+					log.Printf("clock: громкость %d: %v", c.volPct, err)
+					c.toTime(now) // не смогли — вернуть часы, а не долбить ошибку каждый тик
+					return
+				}
+				c.volDrawn = true
+			}
 			return
 		}
 		c.toTime(now)
@@ -276,6 +286,27 @@ func (c *Clock) update(now time.Time) {
 			c.showTime()
 		}
 	}
+}
+
+// writeBrightness — PWM на панель; горящее двоеточие синхронизируется
+// (оно — отдельный LED, PWM родителя его не накрывает: ловилось «цифры
+// яркие — двоеточие тусклое»). Только из update.
+func (c *Clock) writeBrightness() error {
+	if c.brightFile == "" {
+		return fmt.Errorf("нет файла яркости")
+	}
+	if err := writeStr(c.brightFile, fmt.Sprint(c.bright)); err != nil {
+		return err
+	}
+	return c.resyncColon()
+}
+
+// writeCurrent — аналоговый ток 1..4. Только из update.
+func (c *Clock) writeCurrent() error {
+	if c.curDiv == "" {
+		return fmt.Errorf("нет current_divider")
+	}
+	return writeStr(c.curDiv, fmt.Sprint(c.cur))
 }
 
 // toTime — вернуться в режим часов (запомнить текущую минуту, чтобы
