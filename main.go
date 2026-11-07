@@ -222,15 +222,11 @@ func main() {
 				// яркость панели — от того же датчика; пишем только при изменении
 				if b := light.ClockPWM(ema); b != bright {
 					bright = b
-					if err := clk.SetBrightness(byte(b)); err != nil {
-						log.Printf("clock: %v", err)
-					}
+					clk.SetBrightness(byte(b))
 				}
 				if c := light.ClockCurrent(ema); c != cur {
 					cur = c
-					if err := clk.SetCurrent(c); err != nil {
-						log.Printf("clock: %v", err)
-					}
+					clk.SetCurrent(c)
 				}
 			}
 		}
@@ -393,10 +389,7 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			if clk != nil {
-				clk.Off()
-			}
-			log.Printf("marusia-d стоп")
+			log.Printf("marusia-d стоп") // панель и кольцо гасят свои акторы
 			return
 		case state := <-mpdLink.statesCh:
 			// Кольцо от mpd не светится (по просьбе): радуга на play мешает.
@@ -405,9 +398,9 @@ func main() {
 			if clk != nil {
 				switch state {
 				case "play":
-					clk.PlayFaces(ctx, []string{"neutral", "curious", "surprised"})
+					clk.PlayFaces([]string{"neutral", "curious", "surprised"})
 				case "pause":
-					clk.PlayFaces(ctx, []string{"sleepy"})
+					clk.PlayFaces([]string{"sleepy"})
 				}
 			}
 			log.Printf("mpd: %s", state)
@@ -447,17 +440,17 @@ func main() {
 			case "listening":
 				rg.SetDialog("listening")
 				if clk != nil {
-					clk.PlayFaces(ctx, []string{"curious"})
+					clk.PlayFaces([]string{"curious"})
 				}
 			case "thinking":
 				rg.SetDialog("thinking")
 				if clk != nil {
-					clk.PlayFaces(ctx, []string{"wink"})
+					clk.PlayFaces([]string{"wink"})
 				}
 			case "tts_speaking":
 				rg.SetDialog("speaking")
 				if clk != nil {
-					clk.PlayFaces(ctx, []string{"neutral"})
+					clk.PlayFaces([]string{"neutral"})
 				}
 			case "tts_finished", "idle":
 				rg.SetDialog("")

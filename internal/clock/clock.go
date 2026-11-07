@@ -3,6 +3,14 @@
 // Логика повторяет vendor-скрипт clockdisp: текст — запись в linedisp/message,
 // произвольные маски сегментов — патч 4 управляющих кодов в map_seg7,
 // двоеточие — обычные leds (clock:colon:top/bottom).
+//
+// Архитектура — АКТОР (как ring.Ring): единственная горутина Serve владеет
+// всем состоянием панели и ЕДИНСТВЕННАЯ пишет в sysfs. Любое действие —
+// команда через cmdCh (PlayFaces/ShowVolume/SetBrightness/SetCurrent);
+// мьютексов, флагов занятости и фоновых горутин нет — параллельные
+// анимации невозможны структурно. Отрисовка — по тику 100 мс: режим
+// определяет, что на панели (время / лицо / громкость), запись происходит
+// только при смене содержимого.
 package clock
 
 import (
@@ -12,8 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -31,11 +37,40 @@ const (
 	blank     = 0x00
 )
 
-// VOLUME_SHOW_MS — сколько на панели держатся проценты громкости перед
-// возвратом к часам.
-const VOLUME_SHOW_MS = 1500 * time.Millisecond
+const (
+	VOLUME_SHOW_MS = 1500 * time.Millisecond // сколько на панели держатся проценты громкости
+	FACE_MS        = 350 * time.Millisecond  // длительность одного лица в анимации
+	renderInterval = 100 * time.Millisecond  // тик отрисовки актора
+)
 
-// Clock — пути в sysfs. Open находит дисплей так же, как clockdisp.
+// Команды актору.
+const (
+	cmdPlayFaces = iota
+	cmdShowVolume
+	cmdSetBrightness
+	cmdSetCurrent
+)
+
+// clockCmd — команда актору. Fire-and-forget: подтверждение не нужно —
+// запись sysfs занимает миллисекунды, ошибки актор логирует сам.
+type clockCmd struct {
+	kind  int
+	faces []string // cmdPlayFaces
+	pct   int      // cmdShowVolume
+	val   int      // cmdSetBrightness (0..255) / cmdSetCurrent (1..4)
+}
+
+// Режим панели — что сейчас должно быть нарисовано.
+type modeT int
+
+const (
+	modeTime   modeT = iota // часы ЧЧ:ММ
+	modeFaces               // анимация лиц
+	modeVolume              // проценты громкости
+)
+
+// Clock — пути в sysfs (Open находит дисплей так же, как clockdisp) +
+// состояние владельца: все поля ниже cmdCh доступны ТОЛЬКО из Serve.
 type Clock struct {
 	disp       string // .../linedisp.N
 	message    string
@@ -45,11 +80,14 @@ type Clock struct {
 	colonBot   string
 	curDiv     string // i2c .../current_divider, 1..4
 	bright     byte
-	anim       atomic.Bool   // идёт анимация лиц — Serve панель не трогает
-	faceDoneCh chan struct{} // анимация закончилась — Serve возвращает часы
+	cmdCh      chan clockCmd
 
-	volMu     sync.Mutex  // охраняет showTimer
-	showTimer *time.Timer // отложенный возврат к часам после показа громкости
+	mode       modeT     // текущий режим панели
+	faces      []string  // modeFaces: очередь лиц
+	faceIdx    int       // modeFaces: индекс следующего лица
+	faceNext   time.Time // modeFaces: когда рисовать следующее лицо
+	volUntil   time.Time // modeVolume: когда вернуть часы
+	lastMinute string    // последняя нарисованная минута «15:04» (дедуп)
 }
 
 func Open() (*Clock, error) {
@@ -76,13 +114,13 @@ func Open() (*Clock, error) {
 	}
 
 	c := &Clock{
-		disp:       disp,
-		message:    filepath.Join(disp, "message"),
-		mapSeg:     filepath.Join(disp, "map_seg7"),
-		colonTop:   findLed("clock:colon:top"),
-		colonBot:   findLed("clock:colon:bottom"),
-		bright:     255,
-		faceDoneCh: make(chan struct{}, 1),
+		disp:     disp,
+		message:  filepath.Join(disp, "message"),
+		mapSeg:   filepath.Join(disp, "map_seg7"),
+		colonTop: findLed("clock:colon:top"),
+		colonBot: findLed("clock:colon:bottom"),
+		bright:   255,
+		cmdCh:    make(chan clockCmd),
 	}
 	// яркость — на родительской платформе (уровень панели)
 	for _, b := range []string{filepath.Join(disp, "../brightness"), filepath.Join(disp, "device/brightness")} {
@@ -106,24 +144,163 @@ func findLed(name string) string {
 	return ""
 }
 
-// SetText — показать текст, выравнивание вправо на 4 позиции (как clockdisp).
+// ---------- команды актору (безопасны из любой горутины) ----------
+
+// PlayFaces — проиграть лица по очереди (FACE_MS на лицо). Команда актору:
+// последний запрос побеждает — новая анимация заменяет текущую, а не
+// отбрасывается. По завершении актор сам возвращает часы.
+func (c *Clock) PlayFaces(faces []string) {
+	c.cmdCh <- clockCmd{kind: cmdPlayFaces, faces: faces}
+}
+
+// ShowVolume — показать громкость в процентах вместо часов; через
+// VOLUME_SHOW_MS актор вернёт часы.
+func (c *Clock) ShowVolume(pct int) {
+	c.cmdCh <- clockCmd{kind: cmdShowVolume, pct: pct}
+}
+
+// SetBrightness — PWM 0..255 на панель. Двоеточие — отдельный LED, PWM
+// родителя его не накрывает (vendor clockdisp тоже пишет его абсолютным
+// значением): актор после смены яркости синхронизирует горящее двоеточие,
+// иначе оно отстаёт до следующей перерисовки минутного тика (ловилось:
+// цифры яркие — двоеточие тусклое).
+func (c *Clock) SetBrightness(v byte) {
+	c.cmdCh <- clockCmd{kind: cmdSetBrightness, val: int(v)}
+}
+
+// SetCurrent — аналоговый ток 1..4 (1 ярче всего; 4 — тихий режим).
+func (c *Clock) SetCurrent(v int) {
+	c.cmdCh <- clockCmd{kind: cmdSetCurrent, val: v}
+}
+
+// ---------- актор: единственный писатель в sysfs ----------
+
+// Serve — актор: единственная горутина, владеющая состоянием панели и
+// рисующая её содержимое по тику. Команды приходят через cmdCh.
+// Блокирует, запускать в горутине.
+func (c *Clock) Serve(ctx context.Context) {
+	tick := time.NewTicker(renderInterval)
+	defer tick.Stop()
+
+	c.lastMinute = time.Now().Format("15:04")
+	c.showTime()
+	for {
+		select {
+		case <-ctx.Done():
+			// панель гасим сами при остановке — отдельной Off не нужно
+			c.blank()
+			return
+		case cmd := <-c.cmdCh:
+			c.exec(cmd)
+			c.render(time.Now())
+		case <-tick.C:
+			c.render(time.Now())
+		}
+	}
+}
+
+// exec — исполнить команду внутри актора: поменять режим/состояние и при
+// необходимости немедленно написать содержимое. Отложенные кадры
+// дорисовывает render().
+func (c *Clock) exec(cmd clockCmd) {
+	switch cmd.kind {
+	case cmdPlayFaces:
+		c.mode = modeFaces
+		c.faces = cmd.faces
+		c.faceIdx = 0
+		c.faceNext = time.Time{} // нулевое время → render нарисует сразу
+	case cmdShowVolume:
+		if err := c.setText(fmt.Sprintf("%d", cmd.pct)); err != nil {
+			log.Printf("clock: громкость %d: %v", cmd.pct, err)
+			return
+		}
+		c.mode = modeVolume
+		c.volUntil = time.Now().Add(VOLUME_SHOW_MS)
+	case cmdSetBrightness:
+		if c.brightFile == "" {
+			log.Printf("clock: яркость %d: нет файла яркости", cmd.val)
+			return
+		}
+		c.bright = byte(cmd.val)
+		if err := writeStr(c.brightFile, fmt.Sprint(cmd.val)); err != nil {
+			log.Printf("clock: яркость %d: %v", cmd.val, err)
+			return
+		}
+		c.resyncColon()
+	case cmdSetCurrent:
+		if c.curDiv == "" {
+			log.Printf("clock: current %d: нет current_divider", cmd.val)
+			return
+		}
+		if cmd.val < 1 || cmd.val > 4 {
+			log.Printf("clock: current %d: допустимо 1..4", cmd.val)
+			return
+		}
+		if err := writeStr(c.curDiv, fmt.Sprint(cmd.val)); err != nil {
+			log.Printf("clock: current %d: %v", cmd.val, err)
+		}
+	}
+}
+
+// render — нарисовать то, что должно быть на панели в момент now.
+// Пишет в sysfs только при смене содержимого. Только в акторе.
+func (c *Clock) render(now time.Time) {
+	switch c.mode {
+	case modeFaces:
+		if now.Before(c.faceNext) {
+			return // лицо ещё играет
+		}
+		if c.faceIdx >= len(c.faces) {
+			// анимация кончилась — вернуть часы немедленно
+			c.toTime(now)
+			return
+		}
+		f := c.faces[c.faceIdx]
+		c.faceIdx++
+		c.faceNext = now.Add(FACE_MS)
+		if err := c.face(f); err != nil {
+			log.Printf("clock: лицо %s: %v", f, err)
+			c.toTime(now) // ошибка отыгрыша — сразу часы, анимацию бросаем
+		}
+	case modeVolume:
+		if now.Before(c.volUntil) {
+			return
+		}
+		c.toTime(now)
+	default: // modeTime — перерисовка при смене минуты
+		m := now.Format("15:04")
+		if m != c.lastMinute {
+			c.lastMinute = m
+			c.showTime()
+		}
+	}
+}
+
+// toTime — вернуться в режим часов (запомнить текущую минуту, чтобы
+// не перерисовывать её повторно).
+func (c *Clock) toTime(now time.Time) {
+	c.mode = modeTime
+	c.lastMinute = now.Format("15:04")
+	c.showTime()
+}
+
+// ---------- запись в sysfs (только из Serve) ----------
+
+// setText — показать текст, выравнивание вправо на 4 позиции (как clockdisp).
 // Формат "12:34" зажигает двоеточие.
-func (c *Clock) SetText(text string) error {
+func (c *Clock) setText(text string) error {
 	wantColon := strings.Contains(text, ":")
 	text = strings.ReplaceAll(text, ":", "")
 	s := fmt.Sprintf("%4.4s", text)
 	if err := writeStr(c.message, s); err != nil {
 		return err
 	}
-	if wantColon {
-		return c.Colon(true)
-	}
-	return c.Colon(false)
+	return c.colon(wantColon)
 }
 
-// ShowMasks — произвольные маски на 4 цифры: патчим 4 неиспользуемых
+// showMasks — произвольные маски на 4 цифры: патчим 4 неиспользуемых
 // управляющих кода (0x01..0x04) в map_seg7 и печатаем их.
-func (c *Clock) ShowMasks(m [4]byte) error {
+func (c *Clock) showMasks(m [4]byte) error {
 	raw, err := os.ReadFile(c.mapSeg)
 	if err != nil || len(raw) != 128 {
 		return fmt.Errorf("map_seg7: нужно ровно 128 байт, %v", err)
@@ -137,13 +314,13 @@ func (c *Clock) ShowMasks(m [4]byte) error {
 	return writeStr(c.message, "\x01\x02\x03\x04")
 }
 
-// Face — лицо из clockdisp: два глаза на средних цифрах, нос — нижняя точка.
-func (c *Clock) Face(name string) error {
+// face — лицо из clockdisp: два глаза на средних цифрах, нос — нижняя точка.
+func (c *Clock) face(name string) error {
 	l, r, ok := faceEyes(name)
 	if !ok {
 		return fmt.Errorf("нет лица %q", name)
 	}
-	if err := c.ShowMasks([4]byte{blank, l, r, blank}); err != nil {
+	if err := c.showMasks([4]byte{blank, l, r, blank}); err != nil {
 		return err
 	}
 	if c.colonTop != "" && c.colonBot != "" {
@@ -153,86 +330,48 @@ func (c *Clock) Face(name string) error {
 	return nil
 }
 
-// PlayFaces — проиграть лица по очереди (350 мс на лицо) в фоновой горутине.
-// С начала анимации Serve панель не трогает; по завершении возвращает часы.
-// Прерывание: ctx или ошибка отыгрыша лица.
-func (c *Clock) PlayFaces(ctx context.Context, faces []string) {
-	go func() {
-		c.anim.Store(true)
-		defer c.anim.Store(false)
-		for _, f := range faces {
-			if ctx.Err() != nil {
-				return
-			}
-			if err := c.Face(f); err != nil {
-				log.Printf("clock: лицо %s: %v", f, err)
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(350 * time.Millisecond):
-			}
-		}
-		select {
-		case c.faceDoneCh <- struct{}{}:
-		default:
-		}
-	}()
-}
-
-// ShowVolume — показать громкость в процентах вместо часов; через VOLUME_SHOW_MS
-// вернуть часы. Во время анимации лиц панель не трогаем (закон занятости).
-func (c *Clock) ShowVolume(pct int) {
-	if c.anim.Load() {
-		return
-	}
-	if err := c.SetText(fmt.Sprintf("%d", pct)); err != nil {
-		log.Printf("clock: громкость %d: %v", pct, err)
-		return
-	}
-	c.volMu.Lock()
-	defer c.volMu.Unlock()
-	if c.showTimer != nil {
-		c.showTimer.Stop()
-	}
-	c.showTimer = time.AfterFunc(VOLUME_SHOW_MS, c.showTime)
-}
-
-// Serve — фоновый цикл панели: держать актуальное время (проверка каждую
-// секунду, перерисовка при смене минуты). Пока идёт анимация лиц (anim),
-// панель не трогает; по faceDoneCh — возвращает часы. Запускать в горутине.
-func (c *Clock) Serve(ctx context.Context) {
-	last := ""
-	c.showTime()
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-c.faceDoneCh:
-			// анимация закончилась — вернуть часы немедленно
-			c.showTime()
-			last = time.Now().Format("15:04")
-		case <-tick.C:
-			if c.anim.Load() {
-				continue // играет лицо — не затирать
-			}
-			now := time.Now().Format("15:04")
-			if now != last {
-				last = now
-				c.showTime()
-			}
-		}
-	}
-}
-
 // showTime — текущее время ЧЧ:ММ.
 func (c *Clock) showTime() {
-	if err := c.SetText(time.Now().Format("15:04")); err != nil {
+	if err := c.setText(time.Now().Format("15:04")); err != nil {
 		log.Printf("clock: %v", err)
 	}
+}
+
+// blank — погасить всё (финал при остановке актора).
+func (c *Clock) blank() {
+	if err := writeStr(c.message, "    "); err != nil {
+		log.Printf("clock: гашение: %v", err)
+	}
+	c.colon(false)
+}
+
+// colon — двоеточие on/off.
+func (c *Clock) colon(on bool) error {
+	v := "0"
+	if on {
+		v = fmt.Sprint(c.bright)
+	}
+	for _, p := range []string{c.colonTop, c.colonBot} {
+		if p == "" {
+			continue
+		}
+		if err := writeStr(p, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resyncColon — поднять двоеточие до текущей яркости, если оно горит.
+func (c *Clock) resyncColon() error {
+	if c.colonTop == "" {
+		return nil
+	}
+	b, err := os.ReadFile(c.colonTop)
+	if err != nil || strings.TrimSpace(string(b)) == "0" {
+		return nil // выключено — не включаем
+	}
+	return c.colon(true)
 }
 
 func faceEyes(name string) (byte, byte, bool) {
@@ -255,70 +394,6 @@ func faceEyes(name string) (byte, byte, bool) {
 		return AngryEyeL, AngryEyeR, true
 	}
 	return 0, 0, false
-}
-
-// Colon — двоеточие on/off.
-func (c *Clock) Colon(on bool) error {
-	v := "0"
-	if on {
-		v = fmt.Sprint(c.bright)
-	}
-	for _, p := range []string{c.colonTop, c.colonBot} {
-		if p == "" {
-			continue
-		}
-		if err := writeStr(p, v); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Off — погасить всё.
-func (c *Clock) Off() error {
-	if err := writeStr(c.message, "    "); err != nil {
-		return err
-	}
-	return c.Colon(false)
-}
-
-// SetBrightness — PWM 0..255 на панель. Двоеточие — отдельный LED, PWM
-// родителя его не накрывает (vendor clockdisp тоже пишет его абсолютным
-// значением): после смены яркости синхронизируем, иначе оно отстаёт до
-// следующей перерисовки минутного тика (ловилось: цифры яркие —
-// двоеточие тусклое).
-func (c *Clock) SetBrightness(v byte) error {
-	if c.brightFile == "" {
-		return fmt.Errorf("нет файла яркости")
-	}
-	c.bright = v
-	if err := writeStr(c.brightFile, fmt.Sprint(v)); err != nil {
-		return err
-	}
-	return c.resyncColon()
-}
-
-// resyncColon — поднять двоеточие до текущей яркости, если оно горит.
-func (c *Clock) resyncColon() error {
-	if c.colonTop == "" {
-		return nil
-	}
-	b, err := os.ReadFile(c.colonTop)
-	if err != nil || strings.TrimSpace(string(b)) == "0" {
-		return nil // выключено — не включаем
-	}
-	return c.Colon(true)
-}
-
-// SetCurrent — аналоговый ток 1..4 (1 ярче всего; 4 — тихий режим).
-func (c *Clock) SetCurrent(v int) error {
-	if c.curDiv == "" {
-		return fmt.Errorf("нет current_divider")
-	}
-	if v < 1 || v > 4 {
-		return fmt.Errorf("current 1..4, получено %d", v)
-	}
-	return writeStr(c.curDiv, fmt.Sprint(v))
 }
 
 func writeStr(path, s string) error {
