@@ -40,7 +40,7 @@ const (
 const (
 	VOLUME_SHOW_MS = 1500 * time.Millisecond // сколько на панели держатся проценты громкости
 	FACE_MS        = 350 * time.Millisecond  // длительность одного лица в анимации
-	renderInterval = 100 * time.Millisecond  // тик отрисовки актора
+	updateInterval = 100 * time.Millisecond  // тик актора (шаг состояния панели)
 )
 
 // Команды актору.
@@ -179,7 +179,7 @@ func (c *Clock) SetCurrent(v int) {
 // рисующая её содержимое по тику. Команды приходят через cmdCh.
 // Блокирует, запускать в горутине.
 func (c *Clock) Serve(ctx context.Context) {
-	tick := time.NewTicker(renderInterval)
+	tick := time.NewTicker(updateInterval)
 	defer tick.Stop()
 
 	c.lastMinute = time.Now().Format("15:04")
@@ -192,23 +192,23 @@ func (c *Clock) Serve(ctx context.Context) {
 			return
 		case cmd := <-c.cmdCh:
 			c.exec(cmd)
-			c.render(time.Now())
+			c.update(time.Now())
 		case <-tick.C:
-			c.render(time.Now())
+			c.update(time.Now())
 		}
 	}
 }
 
 // exec — исполнить команду внутри актора: поменять режим/состояние и при
 // необходимости немедленно написать содержимое. Отложенные кадры
-// дорисовывает render().
+// дорисовывает update().
 func (c *Clock) exec(cmd clockCmd) {
 	switch cmd.kind {
 	case cmdPlayFaces:
 		c.mode = modeFaces
 		c.faces = cmd.faces
 		c.faceIdx = 0
-		c.faceNext = time.Time{} // нулевое время → render нарисует сразу
+		c.faceNext = time.Time{} // нулевое время → update нарисует сразу
 	case cmdShowVolume:
 		if err := c.setText(fmt.Sprintf("%d", cmd.pct)); err != nil {
 			log.Printf("clock: громкость %d: %v", cmd.pct, err)
@@ -242,9 +242,11 @@ func (c *Clock) exec(cmd clockCmd) {
 	}
 }
 
-// render — нарисовать то, что должно быть на панели в момент now.
-// Пишет в sysfs только при смене содержимого. Только в акторе.
-func (c *Clock) render(now time.Time) {
+// update — шаг состояния панели в момент now: двигает анимацию лиц,
+// возвращает часы по истечении громкости, перерисовывает время при смене
+// минуты. «Рисует» (пишет в sysfs) только при смене содержимого — в
+// отличие от ring.render, кадр каждый тик не строится.
+func (c *Clock) update(now time.Time) {
 	switch c.mode {
 	case modeFaces:
 		if now.Before(c.faceNext) {
