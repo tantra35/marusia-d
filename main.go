@@ -20,11 +20,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -183,10 +185,11 @@ func main() {
 	mpdAddr := flag.String("mpd", "127.0.0.1:6600", "адрес MPD")
 	lvaAddr := flag.String("lva", ":6055", "слушать LVA peripheral API на этом адресе; пусто = выключено")
 	lvaLight := flag.Bool("lva-light", true, "регистрировать кольцо как light-сущность HA")
+	volapiAddr := flag.String("volapi", "127.0.0.1:6056", "слушать volume-API (upmpdcli externalvolumecontrol) на этом адресе; пусто = выключено")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime)
-	log.Printf("marusia-d старт: mpd=%s lva=%q", *mpdAddr, *lvaAddr)
+	log.Printf("marusia-d старт: mpd=%s lva=%q volapi=%q", *mpdAddr, *lvaAddr, *volapiAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -304,6 +307,78 @@ func main() {
 		lastVolNotify = time.Now()
 		volFeedback(pct)
 	}
+	// ---------- volume API для upmpdcli (externalvolumecontrol) ----------
+	// mpd при mixer_type none громкость не регулирует: DLNA-слайдер доезжает
+	// через хуки upmpdcli (getexternalvolume/onvolumechange — dumb-пайпы
+	// printf | nc на этот listener). Протокол построчный:
+	//   GET          → визуальные 0..100 (текущий sink);
+	//   SET <0..100> → sink = round(v*1.5), отклик кольцо/панель/звук.
+	// Шкала: визуальная 0..VOLUME_VISUAL_MAX ↔ физическая 0..VOLUME_MAX_PCT.
+	volapiServe := func(addr string) {
+		if addr == "" {
+			return
+		}
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Printf("volapi: %v — DLNA-громкость через upmpdcli не работает", err)
+			return
+		}
+		go func() {
+			<-ctx.Done()
+			ln.Close()
+		}()
+		log.Printf("volapi: слушаю %s", addr)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("volapi: accept: %v", err)
+				continue
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(2 * time.Second))
+				sc := bufio.NewScanner(conn)
+				if !sc.Scan() {
+					return
+				}
+				fields := strings.Fields(strings.TrimSpace(sc.Text()))
+				if len(fields) == 0 {
+					return
+				}
+				switch fields[0] {
+				case "GET":
+					p := getSinkPct()
+					if p < 0 {
+						return
+					}
+					if p > VOLUME_MAX_PCT {
+						p = VOLUME_MAX_PCT
+					}
+					fmt.Fprintf(conn, "%d\n", (p*100+75)/VOLUME_MAX_PCT)
+				case "SET":
+					if len(fields) < 2 {
+						return
+					}
+					v, err := strconv.Atoi(fields[1])
+					if err != nil || v < 0 {
+						log.Printf("volapi: SET %q: не число", fields[1])
+						return
+					}
+					if v > VOLUME_VISUAL_MAX {
+						v = VOLUME_VISUAL_MAX
+					}
+					setSinkPct((v*VOLUME_MAX_PCT + 50) / 100)
+					volFeedback(v)
+				default:
+					log.Printf("volapi: неизвестная команда %q", fields[0])
+				}
+			}(conn)
+		}
+	}
+	go volapiServe(*volapiAddr)
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
 	// (5% по умолчанию, --peripheral-volume-step), результат прилетит
