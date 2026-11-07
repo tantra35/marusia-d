@@ -8,9 +8,13 @@
 // всем состоянием панели и ЕДИНСТВЕННАЯ пишет в sysfs. Любое действие —
 // команда через cmdCh (PlayFaces/ShowVolume/SetBrightness/SetCurrent);
 // мьютексов, флагов занятости и фоновых горутин нет — параллельные
-// анимации невозможны структурно. Отрисовка — по тику 100 мс: режим
+// анимации невозможны структурно. Шаг состояния — по тику 100 мс: режим
 // определяет, что на панели (время / лицо / громкость), запись происходит
 // только при смене содержимого.
+//
+// Горячие пути — БЕЗ аллокаций: дедуп минуты по Unix()/60 (не Format),
+// поля и числа собираются в переиспользуемые буферы актора (fieldBuf/
+// numBuf), map_seg7 кэшируется один раз и патчится на месте.
 package clock
 
 import (
@@ -19,6 +23,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,6 +74,14 @@ const (
 	modeVolume              // проценты громкости
 )
 
+// maskCodes — 4 неиспользуемых управляющих кода map_seg7, которые патчит
+// showMasks (пакетная переменная: пишется в sysfs каждый шаг лица —
+// конверсия строки в []byte на каждом вызове исключена).
+var maskCodes = [4]byte{0x01, 0x02, 0x03, 0x04}
+
+// zeroDigit — «0» для выключения LED (writeBytes, без конверсии строки).
+var zeroDigit = [1]byte{'0'}
+
 // Clock — пути в sysfs (Open находит дисплей так же, как clockdisp) +
 // состояние владельца: все поля ниже cmdCh доступны ТОЛЬКО из Serve.
 type Clock struct {
@@ -92,7 +105,15 @@ type Clock struct {
 	cur         int       // current_divider 1..4 (на панель попадёт update'ом)
 	brightDirty bool      // яркость изменилась — update перезапишет
 	curDirty    bool      // current изменился — update перезапишет
-	lastMinute  string    // последняя нарисованная минута «15:04» (дедуп)
+
+	// дедуп минут без аллокаций: номер минуты Unix()/60; −1 = ещё не рисовали
+	lastMinBucket int64
+
+	// буферы актора (переиспользуются, ноль аллокаций на запись):
+	segMap   [128]byte // кэш map_seg7: читается один раз, патчится на месте
+	segHave  bool
+	fieldBuf [4]byte // выравненное поле 4 символов для message
+	numBuf   [8]byte // числовые значения (яркость/ток/громкость) для sysfs
 }
 
 func Open() (*Clock, error) {
@@ -187,7 +208,7 @@ func (c *Clock) Serve(ctx context.Context) {
 	tick := time.NewTicker(updateInterval)
 	defer tick.Stop()
 
-	c.lastMinute = "" // пустая минута → первый update нарисует часы
+	c.lastMinBucket = -1 // −1 → первый update нарисует часы
 	for {
 		select {
 		case <-ctx.Done():
@@ -269,7 +290,7 @@ func (c *Clock) update(now time.Time) {
 	case modeVolume:
 		if now.Before(c.volUntil) {
 			if !c.volDrawn {
-				if err := c.setText(fmt.Sprintf("%d", c.volPct)); err != nil {
+				if err := c.writeText(c.appendNum(c.volPct), false); err != nil {
 					log.Printf("clock: громкость %d: %v", c.volPct, err)
 					c.toTime(now) // не смогли — вернуть часы, а не долбить ошибку каждый тик
 					return
@@ -279,11 +300,10 @@ func (c *Clock) update(now time.Time) {
 			return
 		}
 		c.toTime(now)
-	default: // modeTime — перерисовка при смене минуты
-		m := now.Format("15:04")
-		if m != c.lastMinute {
-			c.lastMinute = m
-			c.showTime()
+	default: // modeTime — перерисовка при смене минуты (дедуп без аллокаций)
+		if bucket := now.Unix() / 60; bucket != c.lastMinBucket {
+			c.lastMinBucket = bucket
+			c.showTime(now)
 		}
 	}
 }
@@ -295,7 +315,7 @@ func (c *Clock) writeBrightness() error {
 	if c.brightFile == "" {
 		return fmt.Errorf("нет файла яркости")
 	}
-	if err := writeStr(c.brightFile, fmt.Sprint(c.bright)); err != nil {
+	if err := writeBytes(c.brightFile, c.appendNum(int(c.bright))); err != nil {
 		return err
 	}
 	return c.resyncColon()
@@ -306,45 +326,64 @@ func (c *Clock) writeCurrent() error {
 	if c.curDiv == "" {
 		return fmt.Errorf("нет current_divider")
 	}
-	return writeStr(c.curDiv, fmt.Sprint(c.cur))
+	return writeBytes(c.curDiv, c.appendNum(c.cur))
 }
 
 // toTime — вернуться в режим часов (запомнить текущую минуту, чтобы
 // не перерисовывать её повторно).
 func (c *Clock) toTime(now time.Time) {
 	c.mode = modeTime
-	c.lastMinute = now.Format("15:04")
-	c.showTime()
+	c.lastMinBucket = now.Unix() / 60
+	c.showTime(now)
 }
 
 // ---------- запись в sysfs (только из Serve) ----------
 
-// setText — показать текст, выравнивание вправо на 4 позиции (как clockdisp).
-// Формат "12:34" зажигает двоеточие.
-func (c *Clock) setText(text string) error {
-	wantColon := strings.Contains(text, ":")
-	text = strings.ReplaceAll(text, ":", "")
-	s := fmt.Sprintf("%4.4s", text)
-	if err := writeStr(c.message, s); err != nil {
+// appendNum — число в переиспользуемый numBuf актора: ноль аллокаций на
+// запись чисел в sysfs (яркость, ток, проценты, нос).
+func (c *Clock) appendNum(v int) []byte {
+	return strconv.AppendInt(c.numBuf[:0], int64(v), 10)
+}
+
+// writeText — показать поле на message, выравнивание вправо на 4 позиции
+// (как %4.4s в clockdisp: длиннее 4 — лишнее слева отрезается, короче —
+// слева добивается пробелами); colon — зажечь двоеточие. Поле собирается
+// в буфер актора, без аллокаций.
+func (c *Clock) writeText(b []byte, colon bool) error {
+	if len(b) > 4 {
+		b = b[:4]
+	}
+	f := c.fieldBuf[:]
+	for i := range f {
+		f[i] = ' '
+	}
+	copy(f[4-len(b):], b)
+	if err := writeBytes(c.message, f); err != nil {
 		return err
 	}
-	return c.colon(wantColon)
+	return c.colon(colon)
 }
 
 // showMasks — произвольные маски на 4 цифры: патчим 4 неиспользуемых
-// управляющих кода (0x01..0x04) в map_seg7 и печатаем их.
+// управляющих кода (0x01..0x04) в map_seg7 и печатаем их. map_seg7
+// читается ОДИН раз в segMap, дальше — патч на месте (чтение 128 Б
+// os.ReadFile на каждом шаге лица — была самая жирная аллокация анимаций).
 func (c *Clock) showMasks(m [4]byte) error {
-	raw, err := os.ReadFile(c.mapSeg)
-	if err != nil || len(raw) != 128 {
-		return fmt.Errorf("map_seg7: нужно ровно 128 байт, %v", err)
+	if !c.segHave {
+		raw, err := os.ReadFile(c.mapSeg)
+		if err != nil || len(raw) != 128 {
+			return fmt.Errorf("map_seg7: нужно ровно 128 байт, %v", err)
+		}
+		copy(c.segMap[:], raw)
+		c.segHave = true
 	}
 	for i, v := range m {
-		raw[1+i] = v
+		c.segMap[1+i] = v
 	}
-	if err := writeFile(c.mapSeg, raw); err != nil {
+	if err := writeBytes(c.mapSeg, c.segMap[:]); err != nil {
 		return err
 	}
-	return writeStr(c.message, "\x01\x02\x03\x04")
+	return writeBytes(c.message, maskCodes[:])
 }
 
 // face — лицо из clockdisp: два глаза на средних цифрах, нос — нижняя точка.
@@ -357,15 +396,22 @@ func (c *Clock) face(name string) error {
 		return err
 	}
 	if c.colonTop != "" && c.colonBot != "" {
-		writeStr(c.colonTop, "0")
-		return writeStr(c.colonBot, fmt.Sprint(c.bright)) // нос
+		writeBytes(c.colonTop, zeroDigit[:])
+		return writeBytes(c.colonBot, c.appendNum(int(c.bright))) // нос
 	}
 	return nil
 }
 
-// showTime — текущее время ЧЧ:ММ.
-func (c *Clock) showTime() {
-	if err := c.setText(time.Now().Format("15:04")); err != nil {
+// showTime — часы ЧЧ:ММ из готового now: поле собирается в буфер актора,
+// без time.Format и без повторного time.Now().
+func (c *Clock) showTime(now time.Time) {
+	h, m := now.Hour(), now.Minute()
+	f := c.fieldBuf[:]
+	f[0] = byte('0' + h/10)
+	f[1] = byte('0' + h%10)
+	f[2] = byte('0' + m/10)
+	f[3] = byte('0' + m%10)
+	if err := c.writeText(f, true); err != nil {
 		log.Printf("clock: %v", err)
 	}
 }
@@ -378,17 +424,17 @@ func (c *Clock) blank() {
 	c.colon(false)
 }
 
-// colon — двоеточие on/off.
+// colon — двоеточие on/off (значение яркости — из numBuf, без аллокаций).
 func (c *Clock) colon(on bool) error {
-	v := "0"
+	v := c.appendNum(0)
 	if on {
-		v = fmt.Sprint(c.bright)
+		v = c.appendNum(int(c.bright))
 	}
-	for _, p := range []string{c.colonTop, c.colonBot} {
+	for _, p := range [2]string{c.colonTop, c.colonBot} {
 		if p == "" {
 			continue
 		}
-		if err := writeStr(p, v); err != nil {
+		if err := writeBytes(p, v); err != nil {
 			return err
 		}
 	}
@@ -396,6 +442,7 @@ func (c *Clock) colon(on bool) error {
 }
 
 // resyncColon — поднять двоеточие до текущей яркости, если оно горит.
+// Редкий путь (только при смене яркости) — чтение с аллокацией допустимо.
 func (c *Clock) resyncColon() error {
 	if c.colonTop == "" {
 		return nil
@@ -435,11 +482,11 @@ func writeStr(path, s string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = f.WriteString(s)
+	_, err = f.WriteString(s) // редкие литералы: конверсия string→[]byte допустима
 	return err
 }
 
-func writeFile(path string, b []byte) error {
+func writeBytes(path string, b []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return err
