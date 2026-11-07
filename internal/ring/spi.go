@@ -60,15 +60,16 @@ func encodeByte(b byte) [4]byte {
 // (Ring.frameBuf): его физические страницы не возвращаются ядру между
 // кадрами, и cache-sync при unmap всегда падает на наши же данные.
 func encodeFrameInto(dst []byte, px [leds][3]byte) []byte {
-	dst = dst[:0]
-	dst = append(dst, make([]byte, resetLen)...)
+	dst = dst[:resetLen] // reset в начале: продлить длину и обнулить на месте
+	clear(dst)           // за len лежит мусор прошлого кадра — clear обязателен
 	for _, p := range px {
 		for _, ch := range []byte{p[1], p[0], p[2]} { // GRB
 			e := encodeByte(ch)
 			dst = append(dst, e[:]...)
 		}
 	}
-	dst = append(dst, make([]byte, resetLen)...)
+	dst = dst[:len(dst)+resetLen] // reset в конце — тоже на месте
+	clear(dst[len(dst)-resetLen:])
 	if len(dst) != frameLen {
 		panic(fmt.Sprintf("кадр %d байт, ожидалось %d", len(dst), frameLen))
 	}
