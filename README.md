@@ -14,7 +14,6 @@
 
 ## Логика
 
-- MPD `player`: `play` → радуга, `pause` → дыхание (янтарь), `stop` → тьма.
 - Панель-часы: время ЧЧ:ММ, при play — лицо wow, при pause — sleepy, потом снова часы.
 - Сенсоры: 115 → vol+5, 114 → vol−5 (фидбек — белая заливка кольца на 600 мс),
   248 → play/pause (предположение — сверить `touch-keys` на устройстве!), прочие коды — в журнал.
@@ -45,7 +44,6 @@ LVA подключается к ней сам. Колонка не знает а
 | `muted true` | muted — тускло-красный статичный |
 | `pipeline_error` | error — три красные вспышки |
 | обрыв связи | noconn — тёмно-красное дыхание (после первого удачного коннекта) |
-| `media_player_playing` | радуга (музыка через LVA) |
 | `volume_changed` | `{"volume": 0.0–1.0}` (upstream) → громкость системного sink (sink = volume×150%) + вспышка цветом уровня и звук |
 
 Приоритет сцен: `solid (HA) > error > noconn > muted > диалог > MPD`.
@@ -69,19 +67,18 @@ MPD и LVA не фатальны: оба линка переподключают
 
 ## Сборка
 
-Go лежит в userspace: `/opt/go-1.26.10/bin`.
+Нужен Go (модуль без cgo-зависимостей). Кросс-сборка в статику под aarch64:
 
 ```bash
-export PATH=/opt/go-1.26.10/bin:$PATH
-cd ~/Загрузки/marusia/marusia-d
-go test ./...          # энкодер кольца
+go test ./...          # энкодер кольца + регресс LVA
 go vet ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
-    -o ../build-rootfs/template/usr/local/bin/marusia-d .
+    -o marusia-d .
 ```
 
-Статический бинарник ~2.5 МБ, без зависимостей — попадает в образ через template
-при очередной сборке rootfs (`build-rootfs.sh`), init-скрипт уже в
+Статический бинарник ~6 МиБ, без зависимостей. Для rootfs-проекта
+(mailru-marusia-rootfs) бинарь кладётся в `template/usr/local/bin/marusia-d`
+и попадает в образ при очередной сборке; init-скрипт —
 `template/etc/init.d/marusia-d` (after mpd pulseaudio).
 
 ## Отладка на устройстве
@@ -96,10 +93,3 @@ marusia-d -ring-dump ffffff
 marusia-d -mpd 127.0.0.1:6600            # все флаги опциональны
 ```
 
-## TODO (по факту на устройстве)
-
-- сверить кодирование кадра: `ringled --dump` vs `marusia-d -ring-dump` (байт в байт);
-- keycode 582 — что это (сейчас: 582=start_listening, 148=play/pause, 248=mic mute);
-- часовой пояс панели-часов (Alpine может жить в UTC);
-- яркость панели-часов от BH1730: PWM 12–255 + current_divider 1–4 (реализовано: `light.ClockPWM`/`ClockCurrent`);
-- коллизия с ringled: демон и vendor-утилита не должны держать spidev одновременно.
