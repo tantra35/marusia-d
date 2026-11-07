@@ -354,7 +354,9 @@ func (c *Clock) writeText(b []byte, colon bool) error {
 		b = b[:4]
 	}
 	f := c.fieldBuf[:]
-	for i := range f {
+	// гасим только левую подкладку: b может алиасить fieldBuf (showTime),
+	// полная очистка затирала бы сами цифры до копирования
+	for i := range f[:4-len(b)] {
 		f[i] = ' '
 	}
 	copy(f[4-len(b):], b)
