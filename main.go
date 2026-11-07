@@ -72,13 +72,6 @@ type mpdLink struct {
 	mu       sync.Mutex
 	conn     *mpd.Client
 	statesCh chan string
-	// onVolume — колбэк «громкость изменилась через API (DLNA/HA/mpd-клиент)»:
-	// вотчер ловит idle-событие mixer и передаёт процент 0..100.
-	onVolume func(int)
-	// lastVol — последняя известная громкость для дедупа: пауза/плей
-	// переоткрывают pulse-вывод и дёргают событие mixer без смены громкости.
-	// -1 = ещё не известно (первое чтение молча запоминается).
-	lastVol int
 }
 
 // Serve — цикл переподключения к mpd: коннект → статус/watch → при обрыве
@@ -131,7 +124,7 @@ func (m *mpdLink) togglePause() {
 }
 
 func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
-	w, err := mpd.NewWatcher("tcp", m.addr, "", "player", "mixer")
+	w, err := mpd.NewWatcher("tcp", m.addr, "", "player")
 	if err != nil {
 		log.Printf("mpd watcher: %v", err)
 		return
@@ -151,26 +144,6 @@ func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
 			case "player":
 				if st, err := c.Status(); err == nil {
 					m.statesCh <- st["state"]
-				}
-			case "mixer":
-				// громкость сменилась через API (DLNA/HA → mpd setvol):
-				// прокинуть в демона — отклик (вспышка кольца, панель).
-				// Sink демон здесь НЕ трогает: масштаб 0..100 → 0..150
-				// делает сам mpd (scale_volume в mpd.conf). На паузе/плей
-				// pulse-вывод переоткрывается и событие mixer приходит
-				// БЕЗ смены громкости (а на паузе volume вообще
-				// исчезает из status) — реагируем только на изменение.
-				if m.onVolume == nil {
-					break
-				}
-				if st, err := c.Status(); err == nil {
-					if v, err := strconv.Atoi(st["volume"]); err == nil && v != m.lastVol {
-						first := m.lastVol < 0
-						m.lastVol = v
-						if !first {
-							m.onVolume(v)
-						}
-					}
 				}
 			}
 		case <-ping.C:
@@ -236,7 +209,7 @@ func main() {
 	}()
 
 	// ---------- mpd ----------
-	mpdLink := &mpdLink{addr: *mpdAddr, statesCh: make(chan string, 8), lastVol: -1}
+	mpdLink := &mpdLink{addr: *mpdAddr, statesCh: make(chan string, 8)}
 	go mpdLink.Serve(ctx)
 
 	// ---------- LVA (периферийный API) ----------
@@ -274,8 +247,9 @@ func main() {
 	}
 	// volFeedback — отклик на смену громкости: звук, вспышка всего кольца
 	// одним цветом уровня, проценты на панели-часах. Звук ПЕРВЫМ: Flash
-	// синхронный — блокирует до конца анимации (~FLASH_MS), иначе paplay
-	// отставал бы на вспышку. pct — ВИЗУАЛЬНАЯ громкость 0..100;
+	// синхронен до первого кадра (rebind), спад дорисовывается в рендере —
+	// paplay после Flash отставал бы от старта вспышки. pct — ВИЗУАЛЬНАЯ
+	// громкость 0..100;
 	volFeedback := func(pct int) {
 		playSound(SOUND_VOLUME)
 		rg.Flash(volumeColor(pct), FLASH_MS)
@@ -293,20 +267,7 @@ func main() {
 		}
 		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 	}
-	// громкость через API (DLNA/HA → mpd setvol → событие mixer). Протокол
-	// MPD ограничен setvol 0..100, но mpd сам масштабирует свой поток
-	// (scale_volume "1.5" в mpd.conf: setvol 100 = 150% на PA). Шкала mpd
-	// 0..100 линейно совпадает с визуальной (setvol 50 = sink 75 = «50»),
-	// так что процент mpd идёт в отклик как есть; sink не трогаем
-	// (его двигают кнопки/HA).
-	var lastVolNotify time.Time
-	mpdLink.onVolume = func(pct int) {
-		if time.Since(lastVolNotify) < 700*time.Millisecond {
-			return
-		}
-		lastVolNotify = time.Now()
-		volFeedback(pct)
-	}
+
 	// ---------- volume API для upmpdcli (externalvolumecontrol) ----------
 	// mpd при mixer_type none громкость не регулирует: DLNA-слайдер доезжает
 	// через хуки upmpdcli (getexternalvolume/onvolumechange — dumb-пайпы
