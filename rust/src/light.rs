@@ -28,6 +28,15 @@ pub fn start(ctx: watch::Receiver<bool>, interval: Duration) -> mpsc::Receiver<f
             logln!("light: bh1730 в /sys/bus/iio не найден — автояркость выключена");
             return;
         };
+        // Окно света у колонки слабое: комната 0.02..3.2 lux (замер
+        // 2026-11-06). Дефолт x1 даёт 1.3 lux на отсчёт — темнота и лампы
+        // слипаются в 0..2 отсчёта. x128 + интеграция 688 мс = 0.001 lux
+        // на отсчёт (шум ±0.01). Лучшее усилие: без этого датчик почти слеп.
+        for (name, val) in [("hardwaregain", "128"), ("integration_time", "0.688296")] {
+            if let Err(e) = std::fs::write(dir.join(name), val) {
+                logln!("light: {}: {}", name, e);
+            }
+        }
         let mut tick = tokio::time::interval(interval);
         let mut ctx = ctx;
         loop {
@@ -48,11 +57,12 @@ pub fn start(ctx: watch::Receiver<bool>, interval: Duration) -> mpsc::Receiver<f
     rx
 }
 
-/// lux → множитель яркости кольца 0.15..1.0 (в темноте приглушаем, при 300+ лк —
-/// полный ход). Без гистерезиса: EMA в main сглаживает скачки.
+/// lux → множитель яркости кольца 0.15..1.0 (в темноте приглушаем, при 3+ лк —
+/// полный ход). Пороги под фактический диапазон окна: ночь ~0.02, лампы ~3.2
+/// (замер 2026-11-06, x128). Без гистерезиса: EMA в main сглаживает скачки.
 pub fn scale(lux: f64) -> f64 {
-    const LO: f64 = 5.0;
-    const HI: f64 = 300.0;
+    const LO: f64 = 0.3;
+    const HI: f64 = 3.0;
     if lux <= LO {
         0.15
     } else if lux >= HI {
@@ -65,8 +75,8 @@ pub fn scale(lux: f64) -> f64 {
 /// lux → яркость панели-часов 0..255. Как scale, но минимум глубже (12/255):
 /// ночью часы не должны светить в потолок.
 pub fn clock_pwm(lux: f64) -> i32 {
-    const LO: f64 = 5.0;
-    const HI: f64 = 300.0;
+    const LO: f64 = 0.3;
+    const HI: f64 = 3.0;
     const LO_PWM: i32 = 12;
     const HI_PWM: i32 = 255;
     if lux <= LO {
@@ -79,12 +89,13 @@ pub fn clock_pwm(lux: f64) -> i32 {
 }
 
 /// lux → current_divider 1..4 (1 ярче всего, 4 — ночной режим).
+/// Пороги под фактический диапазон окна (ночь ~0.02, лампы ~3.2).
 pub fn clock_current(lux: f64) -> i32 {
-    if lux >= 100.0 {
+    if lux >= 2.0 {
         1
-    } else if lux >= 20.0 {
+    } else if lux >= 1.0 {
         2
-    } else if lux >= 5.0 {
+    } else if lux >= 0.3 {
         3
     } else {
         4

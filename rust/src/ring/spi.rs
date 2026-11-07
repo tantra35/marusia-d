@@ -1,13 +1,18 @@
 //! SPI-транспорт кольца: rebind контроллера + отправка кадра через spidev.
 //! Порт internal/ring/spi.go (Go).
 //!
-//! Зависимости от железа (экспериментально проверено 2026-11-06, живая полоса):
+//! Зависимости от железа (экспериментально проверено 2026-11-06/07, живая полоса):
 //!   - бит → 4 SPI-бита: 0 → 1000b, 1 → 1100b («1»=1110 даёт high 0.9 мкс —
 //!     вне спекции WS2812 и декодируется полосой нестабильно);
 //!   - каналы внутри диода в порядке байт, как шлём (для RGB-цвета — G,R,B);
 //!   - кадр = 128 reset + 144 байта (12 диодов × 12 байт) + 128 reset = 400;
-//!   - speed 3 346 144 Гц, bits_per_word=8 (64-битный DMA переставляет байты
-//!     внутри слов — каналы скачмаплены);
+//!   - speed 3 346 144 Гц, bits_per_word=64 = DMA-режим (как у vendor ringled):
+//!     DMA передаёт слово старшим байтом вперёд — компенсируем реверсом
+//!     каждого 8-байтного слова в буфере (encode_frame_into).
+//!     НЕ bits=8: PIO-режим рвёт кадр каждые 16 байт (FIFO не успевает),
+//!     разрывы на проводе защёлкивают мусор в хвосте цепочки — «сектор
+//!     кольца не гаснет после вспышки» (vendor-путь на 40 циклах чист,
+//!     наш bits=8 — нет; A/B 2026-11-07);
 //!   - rebind контроллера (unbind/bind) перед КАЖДЫМ кадром: делитель SPI
 //!     корректен только после probe, мульти-кадровые сессии не живут.
 //!
@@ -43,9 +48,12 @@ pub fn encode_byte(b: u8) -> [u8; 4] {
     [(out >> 24) as u8, (out >> 16) as u8, (out >> 8) as u8, out as u8]
 }
 
-/// Собрать кадр в БУФЕР ДМА: reset + GRB-пиксели + reset. Буфер передаётся
-/// постоянный (живает в акторе): его физические страницы не возвращаются ядру
-/// между кадрами, и cache-sync при unmap всегда падает на наши же данные.
+/// Собрать кадр в БУФЕР ДМА: reset + GRB-пиксели + reset, затем реверс каждого
+/// 8-байтного слова: DMA spicc гонит слово старшим байтом вперёд, без реверса
+/// каналы перемешиваются (vendor-схема ringled). 400 байт = ровно 50 слов.
+/// Буфер передаётся постоянный (живает в акторе): его физические страницы не
+/// возвращаются ядру между кадрами, и cache-sync при unmap всегда падает на
+/// наши же данные.
 pub fn encode_frame_into(buf: &mut [u8; FRAME_LEN], px: &[[u8; 3]; LEDS]) {
     buf[..RESET_LEN].fill(0);
     let mut i = RESET_LEN;
@@ -59,6 +67,10 @@ pub fn encode_frame_into(buf: &mut [u8; FRAME_LEN], px: &[[u8; 3]; LEDS]) {
     }
     buf[i..].fill(0);
     debug_assert_eq!(i + RESET_LEN, FRAME_LEN);
+    for w in (0..buf.len()).step_by(8) {
+        // реверс 64-битных слов
+        buf[w..w + 8].reverse();
+    }
 }
 
 /// spi_ioc_transfer, uapi-порядок полей (bits_per_word ПЕРЕД cs_change),
@@ -114,14 +126,14 @@ fn xfer(fd: i32, prime: &[u8; PRIME_LEN], frame: &[u8; FRAME_LEN]) -> io::Result
             tx_buf: prime.as_ptr() as u64,
             len: PRIME_LEN as u32,
             speed: PRIME_HZ,
-            bits: 8,
+            bits: 64,
             ..XFER_ZERO
         },
         SpiXfer {
             tx_buf: frame.as_ptr() as u64,
             len: FRAME_LEN as u32,
             speed: FRAME_HZ,
-            bits: 8,
+            bits: 64,
             ..XFER_ZERO
         },
     ];
@@ -160,18 +172,50 @@ fn open_dev() -> io::Result<i32> {
 mod tests {
     use super::*;
 
+    /// Кадр в DMA-буфере обязан лежать с реверсом каждого 8-байтного слова:
+    /// DMA spicc гонит слово старшим байтом вперёд (vendor-схема ringled).
+    /// Без реверса каналы перемешиваются.
+    #[test]
+    fn encode_frame_word_reverse() {
+        let px = [[0x10u8, 0xAA, 0x03]; LEDS]; // неравномерный цвет — ловит перестановку
+        let mut frame = [0u8; FRAME_LEN];
+        encode_frame_into(&mut frame, &px);
+        assert_eq!(frame.len(), 400);
+
+        // логический кадр БЕЗ реверса — сборка как на проводе (reset+GRB+reset)
+        let mut logical = [0u8; FRAME_LEN];
+        let mut i = RESET_LEN;
+        for p in px {
+            for &ch in &[p[1], p[0], p[2]] {
+                let e = encode_byte(ch);
+                logical[i..i + 4].copy_from_slice(&e);
+                i += 4;
+            }
+        }
+
+        for w in (0..FRAME_LEN).step_by(8) {
+            for j in 0..8 {
+                assert_eq!(
+                    frame[w + j],
+                    logical[w + 7 - j],
+                    "слово {}: frame[{}]={:02x}, want {:02x} (байт по реверсу слова)",
+                    w,
+                    w + j,
+                    frame[w + j],
+                    logical[w + 7 - j]
+                );
+            }
+        }
+    }
+
     #[test]
     fn encode_frame_is_fixed_length() {
         let mut buf = [0u8; FRAME_LEN];
         let px = [[255u8, 0, 0]; LEDS];
         encode_frame_into(&mut buf, &px);
         assert_eq!(buf.len(), 400);
-        // payload начинается после reset и содержит GRB-кодирование
+        // reset-зоны симметричны нулям — реверс их не меняет
         assert!(buf[..RESET_LEN].iter().all(|&b| b == 0));
         assert!(buf[FRAME_LEN - RESET_LEN..].iter().all(|&b| b == 0));
-        // красный → G=0 → байты 1000b-повторы, R=255 → 1100b-повторы
-        let first_payload = &buf[RESET_LEN..RESET_LEN + 4];
-        let g_encoded = encode_byte(0);
-        assert_eq!(first_payload, g_encoded);
     }
 }

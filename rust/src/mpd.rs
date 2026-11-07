@@ -2,7 +2,7 @@
 //!
 //! Протокол — текстовый MPD-протокол (command list, idle), используем ровно
 //! те команды, что были в gompd: greeting «OK MPD …», status, pause N,
-//! ping, idle player mixer. gompd-пакет остаётся эталоном (внутри то же самое).
+//! ping, idle player. gompd-пакет остаётся эталоном (внутри то же самое).
 //!
 //! Отличие от Go: tokio TcpStream не умеет try_clone, поэтому общих
 //! коннекций нет — watcher/ping/toggle_pause открывают свои (mpd локальный,
@@ -135,8 +135,10 @@ impl MpdLink {
         }
     }
 
-    /// watch: idle-коннекция ловит события player/mixer, ping каждые 2 с
-    /// проверяет живость основной коннекции (через собственное соединение).
+    /// watch: idle-коннекция ловит события player (mixer не нужен: громкость
+    /// — sink PA, пауза/плей переоткрывают pulse-вывод без смены громкости,
+    /// отклик не дёргаем), ping каждые 2 с проверяет живость основной
+    /// коннекции (через собственное соединение).
     async fn watch(&self, ctx: &mut watch::Receiver<bool>, c: &mut Client) {
         let mut w = match Client::dial(&self.addr).await {
             Ok(w) => w,
@@ -181,14 +183,14 @@ impl MpdLink {
                 _ = dead_rx.recv() => {
                     return;
                 }
-                ev = w.idle("player mixer") => {
+                ev = w.idle("player") => {
                     match ev {
                         Err(e) => {
                             logln!("mpd watcher: {}", e);
                             return;
                         }
                         Ok(subs) => {
-                            if subs.iter().any(|s| s == "player" || s == "mixer") {
+                            if subs.iter().any(|s| s == "player") {
                                 if let Ok(st) = c.status().await {
                                     if let Some(state) = st.get("state") {
                                         let _ = self.states_tx.send(state.clone());

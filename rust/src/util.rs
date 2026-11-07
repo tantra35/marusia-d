@@ -8,11 +8,6 @@ pub fn hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
-/// Время ЧЧ:ММ — формат часов панели (Go: time.Format("15:04")).
-pub fn hm() -> String {
-    chrono::Local::now().format("%H:%M").to_string()
-}
-
 /// Спать d, но проснуться раньше, если ctx отменён (аналог sleepCtx).
 pub async fn sleep_ctx(ctx: &mut watch::Receiver<bool>, d: Duration) {
     tokio::select! {

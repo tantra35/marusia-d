@@ -23,9 +23,12 @@ mod ring;
 mod touch;
 mod util;
 
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::clock::Clock;
@@ -46,22 +49,26 @@ const SOUND_MIC_OFF: &str = "/etc/sounds/05_mic_on_to_mic_off.flac";
 const SOUND_MIC_ON: &str = "/etc/sounds/06_mic_off_to_mic_on.flac";
 /// вспышка громкости: дыхание 0.8 с
 const FLASH: Duration = Duration::from_millis(800);
-/// потолок громкости sink, больше нельзя
+/// физическая громкость sink, больше нельзя
 const VOLUME_MAX_PCT: i32 = 150;
+/// визуальная шкала (кольцо, панель): 0..100
+const VOLUME_VISUAL_MAX: i32 = 100;
 
 fn main() {
-    let (mpd_addr, lva_addr, lva_light) = parse_flags();
+    let (mpd_addr, lva_addr, lva_light, volapi_addr) = parse_flags();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run(mpd_addr, lva_addr, lva_light));
+        .block_on(run(mpd_addr, lva_addr, lva_light, volapi_addr));
 }
 
-/// Разбор флагов в стиле Go flag: -mpd АДРЕС, -lva АДРЕС, -lva-light[=bool].
-fn parse_flags() -> (String, String, bool) {
+/// Разбор флагов в стиле Go flag: -mpd АДРЕС, -lva АДРЕС, -volapi АДРЕС,
+/// -lva-light[=bool].
+fn parse_flags() -> (String, String, bool, String) {
     let mut mpd_addr = "127.0.0.1:6600".to_string();
     let mut lva_addr = ":6055".to_string();
+    let mut volapi_addr = "127.0.0.1:6056".to_string();
     let mut lva_light = true;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -75,6 +82,10 @@ fn parse_flags() -> (String, String, bool) {
                 lva_addr = args[i + 1].clone();
                 i += 1;
             }
+            "-volapi" if i + 1 < args.len() => {
+                volapi_addr = args[i + 1].clone();
+                i += 1;
+            }
             f if f.starts_with("-lva-light") => {
                 lva_light = !f.ends_with("=false");
             }
@@ -84,11 +95,16 @@ fn parse_flags() -> (String, String, bool) {
         }
         i += 1;
     }
-    (mpd_addr, lva_addr, lva_light)
+    (mpd_addr, lva_addr, lva_light, volapi_addr)
 }
 
-async fn run(mpd_addr: String, lva_addr: String, lva_light: bool) {
-    logln!("marusia-d старт: mpd={} lva={:?}", mpd_addr, lva_addr);
+async fn run(mpd_addr: String, lva_addr: String, lva_light: bool, volapi_addr: String) {
+    logln!(
+        "marusia-d старт: mpd={} lva={:?} volapi={:?}",
+        mpd_addr,
+        lva_addr,
+        volapi_addr
+    );
 
     // ---------- отмена: SIGINT/SIGTERM ----------
     let (ctx_tx, mut ctx_rx) = watch::channel(false);
@@ -109,13 +125,8 @@ async fn run(mpd_addr: String, lva_addr: String, lva_light: bool) {
     let rg = Ring::new(ctx_rx.clone());
 
     // ---------- панель-часы ----------
-    let clk: Option<Arc<Clock>> = match clock::open() {
-        Ok((c, face_rx)) => {
-            let c2 = Arc::clone(&c);
-            let crx = ctx_rx.clone();
-            tokio::spawn(async move { c2.serve(crx, face_rx).await });
-            Some(c)
-        }
+    let clk: Option<Clock> = match Clock::open(ctx_rx.clone()) {
+        Ok(c) => Some(c),
         Err(e) => {
             logln!("clock: {} — панель-часы выключена", e);
             None
@@ -142,16 +153,12 @@ async fn run(mpd_addr: String, lva_addr: String, lva_light: bool) {
                     let b = light::clock_pwm(ema);
                     if b != bright {
                         bright = b;
-                        if let Err(e) = clk.set_brightness(b.clamp(0, 255) as u8) {
-                            logln!("clock: {}", e);
-                        }
+                        clk.set_brightness(b.clamp(0, 255) as u8);
                     }
                     let c = light::clock_current(ema);
                     if c != cur {
                         cur = c;
-                        if let Err(e) = clk.set_current(c) {
-                            logln!("clock: {}", e);
-                        }
+                        clk.set_current(c);
                     }
                 }
             }
@@ -260,15 +267,57 @@ async fn run(mpd_addr: String, lva_addr: String, lva_light: bool) {
         });
     }
 
+    // ---------- volume API для upmpdcli (externalvolumecontrol) ----------
+    // mpd при mixer_type none громкость не регулирует: DLNA-слайдер доезжает
+    // через хуки upmpdcli (getexternalvolume/onvolumechange — dumb-пайпы
+    // printf | nc на этот listener). Протокол построчный:
+    //   GET          → визуальные 0..100 (текущий sink);
+    //   SET <0..100> → sink = round(v*1.5), отклик кольцо/панель/звук.
+    // Шкала: визуальная 0..VOLUME_VISUAL_MAX ↔ физическая 0..VOLUME_MAX_PCT.
+    {
+        let rg = rg.clone();
+        let clk = clk.clone();
+        let mut ctx = ctx_rx.clone();
+        let addr = volapi_addr.clone();
+        tokio::spawn(async move {
+            if addr.is_empty() {
+                return;
+            }
+            let ln = match TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    logln!("volapi: {} — DLNA-громкость через upmpdcli не работает", e);
+                    return;
+                }
+            };
+            logln!("volapi: слушаю {}", addr);
+            loop {
+                let conn = tokio::select! {
+                    _ = ctx.changed() => {
+                        if crate::util::cancelled(&ctx) { return; }
+                        continue;
+                    }
+                    c = ln.accept() => match c {
+                        Ok((c, _)) => c,
+                        Err(e) => {
+                            logln!("volapi: accept: {}", e);
+                            continue;
+                        }
+                    }
+                };
+                let rg = rg.clone();
+                let clk = clk.clone();
+                tokio::spawn(volapi_conn(conn, rg, clk));
+            }
+        });
+    }
+
     // ---------- главный цикл ----------
     loop {
         tokio::select! {
             _ = ctx_rx.changed() => {
                 if crate::util::cancelled(&ctx_rx) {
-                    if let Some(clk) = &clk {
-                        let _ = clk.off();
-                    }
-                    logln!("marusia-d стоп");
+                    logln!("marusia-d стоп"); // панель и кольцо гасят свои акторы
                     return;
                 }
             }
@@ -279,8 +328,8 @@ async fn run(mpd_addr: String, lva_addr: String, lva_light: bool) {
                 rg.set_mpd();
                 if let Some(clk) = &clk {
                     match state.as_str() {
-                        "play" => clk.play_faces(ctx_rx.clone(), &["neutral", "curious", "surprised"]),
-                        "pause" => clk.play_faces(ctx_rx.clone(), &["sleepy"]),
+                        "play" => clk.play_faces(&["neutral", "curious", "surprised"]),
+                        "pause" => clk.play_faces(&["sleepy"]),
                         _ => {}
                     }
                 }
@@ -298,26 +347,71 @@ async fn run(mpd_addr: String, lva_addr: String, lva_light: bool) {
                     lva_events_rx = None;
                     continue;
                 };
-                handle_lva_event(&e, &rg, &clk, &ctx_rx).await;
+                handle_lva_event(&e, &rg, &clk).await;
             }
         }
     }
 }
 
-async fn handle_lva_event(
-    e: &Event,
-    rg: &Ring,
-    clk: &Option<Arc<Clock>>,
-    ctx: &watch::Receiver<bool>,
-) {
+/// Одно соединение volapi: строка команды с таймаутом 2 с (dumb-пайп
+/// printf | nc: открыл, послал, прочитал, закрыл).
+async fn volapi_conn(conn: TcpStream, rg: Ring, clk: Option<Clock>) {
+    let work = async {
+        let (r, mut w) = conn.into_split();
+        let mut r = BufReader::new(r);
+        let mut line = String::new();
+        if r.read_line(&mut line).await? == 0 {
+            return Ok(()); // пустое соединение
+        }
+        let fields: Vec<&str> = line.trim().split_whitespace().collect();
+        if fields.is_empty() {
+            return Ok(());
+        }
+        match fields[0] {
+            "GET" => {
+                let Some(p) = get_sink_pct().await else { return Ok(()) };
+                let p = p.min(VOLUME_MAX_PCT);
+                // физическая → визуальная с округлением до ближайшего
+                let vis = (p * 100 + 75) / VOLUME_MAX_PCT;
+                w.write_all(format!("{}\n", vis).as_bytes()).await?;
+            }
+            "SET" => {
+                let Some(q) = fields.get(1) else { return Ok(()) };
+                let v = match q.parse::<i32>() {
+                    Ok(v) if v >= 0 => v,
+                    _ => {
+                        logln!("volapi: SET {:?}: не число", q);
+                        return Ok(());
+                    }
+                };
+                let v = v.min(VOLUME_VISUAL_MAX);
+                set_sink_pct((v * VOLUME_MAX_PCT + 50) / 100).await;
+                vol_feedback(&rg, &clk, v).await;
+            }
+            other => {
+                logln!("volapi: неизвестная команда {:?}", other);
+            }
+        }
+        Ok::<(), io::Error>(())
+    };
+    if tokio::time::timeout(Duration::from_secs(2), work)
+        .await
+        .is_err()
+    {
+        logln!("volapi: таймаут 2с");
+    }
+}
+
+async fn handle_lva_event(e: &Event, rg: &Ring, clk: &Option<Clock>) {
     match e.event.as_str() {
         lva::EV_DOWN => rg.set_live(false),
         "snapshot" => {
             rg.set_snapshot(e.bool("muted"));
             if e.has("volume") {
-                // upstream: volume — доля 0.0..1.0; sink — источник истины
-                // по громкости колонки, синхронизируем при коннекте
-                set_sink_pct((e.float("volume") * 100.0).round() as i32).await;
+                // upstream: volume — доля 0.0..1.0 от максимума колонки
+                // (150%); sink — источник истины по громкости колонки,
+                // синхронизируем при коннекте в физической шкале
+                set_sink_pct((e.float("volume") * VOLUME_MAX_PCT as f64).round() as i32).await;
             }
         }
         "zeroconf" => {
@@ -341,19 +435,19 @@ async fn handle_lva_event(
         "listening" => {
             rg.set_dialog("listening");
             if let Some(clk) = clk {
-                clk.play_faces(ctx.clone(), &["curious"]);
+                clk.play_faces(&["curious"]);
             }
         }
         "thinking" => {
             rg.set_dialog("thinking");
             if let Some(clk) = clk {
-                clk.play_faces(ctx.clone(), &["wink"]);
+                clk.play_faces(&["wink"]);
             }
         }
         "tts_speaking" => {
             rg.set_dialog("speaking");
             if let Some(clk) = clk {
-                clk.play_faces(ctx.clone(), &["neutral"]);
+                clk.play_faces(&["neutral"]);
             }
         }
         "tts_finished" | "idle" => rg.set_dialog(""),
@@ -370,11 +464,12 @@ async fn handle_lva_event(
             rg.set_mpd();
         }
         "volume_changed" => {
-            // upstream: {"volume": float} 0.0..1.0 — применяем к sink
-            // (у LVA аудио уходит в наш sink, так что это одна и та же громкость)
-            let pct = (e.float("volume") * 100.0).round() as i32;
+            // upstream: {"volume": float} 0.0..1.0 — доля от максимума
+            // колонки (150%); sink — в физической шкале, в отклик —
+            // визуальные 0..100 (to_visual)
+            let pct = (e.float("volume") * VOLUME_MAX_PCT as f64).round() as i32;
             set_sink_pct(pct).await;
-            vol_feedback(rg, clk, pct).await;
+            vol_feedback(rg, clk, to_visual(pct)).await;
         }
         "light_command" => {
             let lc = e.light_command();
@@ -401,7 +496,8 @@ async fn handle_lva_event(
     }
 }
 
-/// Текущая громкость default sink в процентах 0..100, None = не узнали.
+/// Текущая физическая громкость default sink в процентах
+/// 0..VOLUME_MAX_PCT, None = не узнали.
 async fn get_sink_pct() -> Option<i32> {
     let out = pactl_output(&["get-sink-volume", "@DEFAULT_SINK@"]).await?;
     for f in out.split_whitespace() {
@@ -414,12 +510,13 @@ async fn get_sink_pct() -> Option<i32> {
     None
 }
 
-/// Отклик на смену громкости: звук, вспышка всего кольца одним цветом уровня
-/// (синий при 0 → оранжевый при 150, breathe-затухание), проценты на
-/// панели-часах. Звук ПЕРВЫМ: он запускается асинхронно и должен уйти раньше
-/// дальнейшей работы (в Go Flash был синхронным — тот же порядок).
+/// Отклик на смену громкости: звук, вспышка всего кольца одним цветом уровня,
+/// проценты на панели-часах. Звук ПЕРВЫМ: он запускается асинхронно и должен
+/// уйти раньше дальнейшей работы (в Go Flash был синхронным до первого кадра
+/// (rebind), спад дорисовывается в рендере — paplay после Flash отставал бы
+/// от старта вспышки). pct — ВИЗУАЛЬНАЯ громкость 0..100;
 /// pct=-1 — громкость не узнали: вспышка белая, панель не трогаем.
-async fn vol_feedback(rg: &Ring, clk: &Option<Arc<Clock>>, pct: i32) {
+async fn vol_feedback(rg: &Ring, clk: &Option<Clock>, pct: i32) {
     play_sound(SOUND_VOLUME);
     rg.flash(volume_color(pct), FLASH);
     if let (Some(clk), true) = (clk, pct >= 0) {
@@ -427,9 +524,9 @@ async fn vol_feedback(rg: &Ring, clk: &Option<Arc<Clock>>, pct: i32) {
     }
 }
 
-/// Абсолютная громкость sink строго в процентах 0..100 (не доля 0..1!).
+/// Физическая громкость sink 0..VOLUME_MAX_PCT (не доля 0..1!).
 async fn set_sink_pct(p: i32) {
-    let p = p.clamp(0, 100);
+    let p = p.clamp(0, VOLUME_MAX_PCT);
     pactl(&["set-sink-volume", "@DEFAULT_SINK@", &format!("{}%", p)]).await;
 }
 
@@ -440,7 +537,7 @@ async fn set_sink_pct(p: i32) {
 async fn vol_step(
     lva_client: &Option<lva::Client>,
     rg: &Ring,
-    clk: &Option<Arc<Clock>>,
+    clk: &Option<Clock>,
     up: bool,
 ) {
     if let Some(c) = lva_client {
@@ -457,7 +554,7 @@ async fn vol_step(
     let mut pct = get_sink_pct().await.unwrap_or(-1);
     if pct >= 0 {
         if (up && pct >= VOLUME_MAX_PCT) || (!up && pct <= 0) {
-            vol_feedback(rg, clk, pct).await; // на пределе — оранжевый отклик, не шагаем
+            vol_feedback(rg, clk, to_visual(pct)).await; // на пределе — оранжевый отклик, не шагаем
             return;
         }
     }
@@ -471,10 +568,22 @@ async fn vol_step(
         set_sink_pct(VOLUME_MAX_PCT).await; // PA умеет >150% — режем потолком
         pct = VOLUME_MAX_PCT;
     }
-    vol_feedback(rg, clk, pct).await;
+    vol_feedback(rg, clk, to_visual(pct)).await;
 }
 
-/// Цвет вспышки громкости, двухсегментный градиент:
+/// Физическая громкость sink (0..VOLUME_MAX_PCT) → визуальная шкала
+/// 0..VOLUME_VISUAL_MAX: на кольце и панели громкость всегда 0..100,
+/// физические 150% показываются как 100. Отрицательное (-1 = «не узнали»)
+/// проходит насквозь без перевода.
+fn to_visual(pct: i32) -> i32 {
+    if pct < 0 {
+        return -1;
+    }
+    pct * VOLUME_VISUAL_MAX / VOLUME_MAX_PCT
+}
+
+/// Цвет вспышки громкости, двухсегментный градиент по ВИЗУАЛЬНОЙ шкале
+/// 0..VOLUME_VISUAL_MAX:
 ///   0..половины — синий → зелёный (B убывает, G растёт);
 ///   половина..максимума — зелёный → оранжевый (R растёт, G спадает до 140).
 /// pct=-1 — уровень не узнали: белая.
@@ -482,7 +591,7 @@ fn volume_color(pct: i32) -> Color {
     if pct < 0 {
         return ring::WHITE;
     }
-    let t = (pct as f64 / VOLUME_MAX_PCT as f64).min(1.0);
+    let t = (pct as f64 / VOLUME_VISUAL_MAX as f64).min(1.0);
     let (r, g, b) = if t <= 0.5 {
         let s = t / 0.5;
         (0.0, 255.0 * s, 255.0 * (1.0 - s))
@@ -549,9 +658,17 @@ mod tests {
         assert_eq!(volume_color(-1), ring::WHITE);
         // 0 — чисто синий (0,0,255)
         assert_eq!(volume_color(0), Color { r: 0, g: 0, b: 255 });
-        // середина — зелёный (0,255,0)
-        assert_eq!(volume_color(VOLUME_MAX_PCT / 2), Color { r: 0, g: 255, b: 0 });
-        // максимум — оранжевый (255,140,0)
-        assert_eq!(volume_color(VOLUME_MAX_PCT), Color { r: 255, g: 140, b: 0 });
+        // середина визуальной шкалы — зелёный (0,255,0)
+        assert_eq!(volume_color(VOLUME_VISUAL_MAX / 2), Color { r: 0, g: 255, b: 0 });
+        // максимум визуальной шкалы — оранжевый (255,140,0)
+        assert_eq!(volume_color(VOLUME_VISUAL_MAX), Color { r: 255, g: 140, b: 0 });
+    }
+
+    #[test]
+    fn visual_scale() {
+        assert_eq!(to_visual(-1), -1, "«не узнали» проходит насквозь");
+        assert_eq!(to_visual(0), 0);
+        assert_eq!(to_visual(75), 50);
+        assert_eq!(to_visual(VOLUME_MAX_PCT), VOLUME_VISUAL_MAX);
     }
 }

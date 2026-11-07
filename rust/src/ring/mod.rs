@@ -83,6 +83,8 @@ pub struct RingState {
     pub last_drawn: String,
     /// время последнего анимационного кадра (прореживание)
     pub last_anim_draw: Option<SystemTime>,
+    /// после анимации статичный кадр перерисовать ещё раз
+    pub pending_confirm: bool,
 }
 
 impl Default for RingState {
@@ -102,6 +104,7 @@ impl Default for RingState {
             overlay_tt: None,
             last_drawn: String::new(),
             last_anim_draw: None,
+            pending_confirm: false,
         }
     }
 }
@@ -184,11 +187,13 @@ impl RingState {
             "solid" => {
                 let c = rgb(self.solid);
                 px.fill(mul(&c, dim));
-                ("solid".to_string(), px, false)
+                // dim в ключе: иначе SetScale на статичной сцене скипается дедупом
+                // (last_drawn совпадёт, кадр с новой яркостью не уйдёт).
+                (format!("solid@{:.2}", dim), px, false)
             }
             "muted" => {
                 px.fill(mul(&MUTED_RGB, dim));
-                ("muted".to_string(), px, false)
+                (format!("muted@{:.2}", dim), px, false)
             }
             "error" => {
                 let on = unix_millis(now) % BLINK_PERIOD_MS < BLINK_PERIOD_MS / 2;
@@ -365,11 +370,19 @@ impl Actor {
     /// Нарисовать кадр, если он отличается от уже показанного. Анимации
     /// рисуются не чаще ANIM_FRAME_INTERVAL: каждый кадр = rebind контроллера,
     /// а частый rebind портит память ядра (UAF в bind/unbind spidev).
-    /// Только в акторе.
+    ///
+    /// Страховка от сбитого финального кадра: WS2812 — сдвиговая цепочка, и
+    /// редкий сбой бита на шине (каждый кадр = unbind/bind) защёлкивает мусор
+    /// в хвосте кольца, причём демон уверен, что кадр ушёл чисто, и дедупом
+    /// больше не перерисовывает (наблюдалось: часть кольца не гаснет после
+    /// вспышки громкости). Поэтому первый статичный кадр после анимации
+    /// (pending_confirm) рисуется ещё раз на следующем тике — один лишний
+    /// rebind на смену сцены, остаток живёт ≤80 мс вместо «до следующего
+    /// события». Только в акторе.
     fn render(&mut self) {
         let now = SystemTime::now();
         let (key, px, animated) = self.st.frame(now);
-        if !animated && key == self.st.last_drawn {
+        if !animated && key == self.st.last_drawn && !self.st.pending_confirm {
             return; // статичный кадр уже на диодах
         }
         if animated
@@ -391,6 +404,8 @@ impl Actor {
             self.st.last_anim_draw = Some(now);
             self.st.last_drawn.clear(); // после анимации статичную сцену перерисовать
         } else {
+            // первый статичный после анимации → подтвердить повтором
+            self.st.pending_confirm = self.st.last_drawn.is_empty();
             self.st.last_drawn = key;
         }
     }
@@ -473,9 +488,32 @@ mod tests {
         let mut r = st();
         r.muted = true;
         let (key, px, animated) = r.frame(SystemTime::now());
-        assert_eq!(key, "muted");
-        assert!(!animated, "want muted без анимации");
+        // dim входит в ключ (иначе SetScale скипается дедупом) — проверяем префикс.
+        assert!(key.starts_with("muted@") && !animated, "want muted без анимации");
         assert_eq!(px[0], MUTED_RGB);
+    }
+
+    /// Смена scale на статичной сцене обязана менять ключ кадра: иначе render()
+    /// скипает по last_drawn и новая яркость от датчика света не доедет до
+    /// диодов (регрессия: ключ был голым "solid"/"muted").
+    #[tokio::test]
+    async fn static_key_includes_scale() {
+        let mut r = st();
+        r.ha_active = true;
+        r.solid = Color { r: 255, g: 255, b: 255 };
+        r.scale = 1.0;
+        let (key1, _, _) = r.frame(SystemTime::now());
+        r.scale = 0.2;
+        let (key2, _, _) = r.frame(SystemTime::now());
+        assert_ne!(key1, key2, "ключ solid не изменился при смене scale, дедуп скипал бы кадр");
+
+        r.ha_active = false;
+        r.muted = true;
+        r.scale = 1.0;
+        let (key3, _, _) = r.frame(SystemTime::now());
+        r.scale = 0.2;
+        let (key4, _, _) = r.frame(SystemTime::now());
+        assert_ne!(key3, key4, "ключ muted не изменился при смене scale, дедуп скипал бы кадр");
     }
 
     #[tokio::test]
