@@ -246,6 +246,17 @@ func main() {
 		}
 		return -1
 	}
+	// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
+	// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама
+	setSinkPct := func(p int) {
+		if p < 0 {
+			p = 0
+		}
+		if p > VOLUME_MAX_PCT {
+			p = VOLUME_MAX_PCT
+		}
+		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
+	}
 	// volFeedback — отклик на смену громкости: звук, вспышка всего кольца
 	// одним цветом уровня, проценты на панели-часах. Звук ПЕРВЫМ: Flash
 	// синхронен до первого кадра (rebind), спад дорисовывается в рендере —
@@ -257,17 +268,6 @@ func main() {
 		if clk != nil && pct >= 0 {
 			clk.ShowVolume(pct)
 		}
-	}
-	// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
-	// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама
-	setSinkPct := func(p int) {
-		if p < 0 {
-			p = 0
-		}
-		if p > VOLUME_MAX_PCT {
-			p = VOLUME_MAX_PCT
-		}
-		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 	}
 
 	// ---------- volume API для upmpdcli (externalvolumecontrol) ----------
