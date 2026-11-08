@@ -475,7 +475,6 @@ func main() {
 				}
 				rg.SetMuted(newMuted)
 			case "wake_word_detected":
-				rg.SetDialog("wake")
 				// API: chime уже играет, у нас нет wake-анимации — короткая
 				// синяя вспышка (peripheral_api.md:111 предлагает анимацию)
 				rg.Flash(ring.Color{R: ring.LISTEN_RGB[0], G: ring.LISTEN_RGB[1], B: ring.LISTEN_RGB[2]}, WAKE_FLASH_MS)

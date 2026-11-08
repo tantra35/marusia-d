@@ -83,7 +83,7 @@ type Ring struct {
 	cmdCh chan ringCmd // команды актору; каждая несёт свой reply-канал
 
 	mpd      string // сцена источника «музыка»: off (радугу убрали — мешала)
-	dialog   string // "" | wake | listening | thinking | speaking
+	dialog   string // "" | listening | thinking | speaking
 	errorT   bool
 	muted    bool
 	lvaSeen  bool // было хоть одно живое соединение с LVA
