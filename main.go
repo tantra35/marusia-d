@@ -431,9 +431,8 @@ func main() {
 			log.Printf("marusia-d стоп") // панель и кольцо гасят свои акторы
 			return
 		case state := <-mpdLink.statesCh:
-			// Кольцо от mpd не светится (по просьбе): радуга на play мешает.
+			// Кольцо от mpd не светится (по просьбе: радуга мешала).
 			// Состояние mpd нужно только для play/pause кнопкой и лиц на панели.
-			rg.SetMPD("off")
 			if clk != nil {
 				switch state {
 				case "play":
@@ -500,9 +499,6 @@ func main() {
 				time.AfterFunc(1600*time.Millisecond, func() {
 					rg.SetError(false)
 				})
-			case "media_player_playing":
-				// музыка через LVA (HA media player) — та же радуга, что и mpd
-				rg.SetMPD("rainbow")
 			case "volume_changed":
 				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
 				// колонки (150%); sink — в физической шкале, в отклик —

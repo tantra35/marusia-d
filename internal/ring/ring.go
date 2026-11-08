@@ -50,8 +50,7 @@ type Color struct{ R, G, B uint8 }
 
 // Команды актору.
 const (
-	cmdSetMPD = iota
-	cmdSetDialog
+	cmdSetDialog = iota
 	cmdSetMuted
 	cmdGetMuted
 	cmdSetError
@@ -82,7 +81,6 @@ type Ring struct {
 	n     int
 	cmdCh chan ringCmd // команды актору; каждая несёт свой reply-канал
 
-	mpd      string // сцена источника «музыка»: off (радугу убрали — мешала)
 	dialog   string // "" | listening | thinking | speaking
 	errorT   bool
 	muted    bool
@@ -114,7 +112,6 @@ func New(dev string, n int) *Ring {
 		n:        n,
 		cmdCh:    make(chan ringCmd),
 		scale:    1,
-		mpd:      "off",
 		frameBuf: make([]byte, resetLen*2+leds*bytesPerLED),
 		primeBuf: make([]byte, primeLen),
 	}
@@ -124,12 +121,6 @@ func New(dev string, n int) *Ring {
 func (r *Ring) send(cmd *ringCmd) any {
 	r.cmdCh <- *cmd
 	return <-cmd.reply
-}
-
-// SetMPD — сцена источника «музыка»: off (радугу убрали — мешала).
-func (r *Ring) SetMPD(scene string) {
-	cmd := ringCmd{kind: cmdSetMPD, str: scene, reply: make(chan any, 1)}
-	r.send(&cmd)
 }
 
 // SetDialog — активная фаза диалога LVA ("" = диалога нет).
@@ -195,7 +186,7 @@ func (r *Ring) Flash(c Color, d time.Duration) {
 }
 
 // resolve — вычислить сцену из состояния: solid (HA) > error > noconn >
-// muted > диалог > mpd. Чистая функция — состояние не меняет.
+// muted > диалог. Чистая функция — состояние не меняет.
 func (r *Ring) resolve() string {
 	switch {
 	case r.haActive:
@@ -209,7 +200,7 @@ func (r *Ring) resolve() string {
 	case r.dialog != "":
 		return r.dialog
 	default:
-		return r.mpd
+		return "off"
 	}
 }
 
@@ -217,8 +208,6 @@ func (r *Ring) resolve() string {
 // Кадр из состояния рисует render(). Только в акторе.
 func (r *Ring) exec(cmd *ringCmd) any {
 	switch cmd.kind {
-	case cmdSetMPD:
-		r.mpd = "off" // радугу убрали — мешала
 	case cmdSetDialog:
 		r.dialog = cmd.str
 	case cmdSetMuted:
