@@ -410,9 +410,9 @@ func main() {
 			if clk != nil {
 				switch state {
 				case "play":
-					clk.PlayFaces([]string{"neutral", "curious", "surprised"})
+					clk.PlayFaces([]string{"sleepy", "curious", "surprised"})
 				case "pause":
-					clk.PlayFaces([]string{"sleepy"})
+					clk.PlayFaces([]string{"surprised", "curious", "sleepy"})
 				}
 			}
 			log.Printf("mpd: %s", state)
