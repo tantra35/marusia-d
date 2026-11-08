@@ -230,33 +230,7 @@ func main() {
 	// ---------- сенсорная панель ----------
 	// громкость — СИСТЕМНАЯ (sink PulseAudio), а не mpd: через sink проходит
 	// всё — музыка mpd, служебные звуки, голос ассистента.
-	// getSinkPct — текущая физическая громкость default sink в процентах
-	// 0..VOLUME_MAX_PCT, -1 = не узнали.
-	getSinkPct := func() int {
-		out, err := pactlOutput("get-sink-volume", "@DEFAULT_SINK@")
-		if err != nil {
-			return -1
-		}
-		for _, f := range strings.Fields(out) {
-			if strings.HasSuffix(f, "%") {
-				if v, err := strconv.Atoi(strings.TrimSuffix(f, "%")); err == nil {
-					return v
-				}
-			}
-		}
-		return -1
-	}
-	// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
-	// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама
-	setSinkPct := func(p int) {
-		if p < 0 {
-			p = 0
-		}
-		if p > VOLUME_MAX_PCT {
-			p = VOLUME_MAX_PCT
-		}
-		pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
-	}
+	// getSinkPct/setSinkPct — статические, рядом с pactl-хелперами внизу.
 	// volFeedback — отклик на смену громкости: звук, вспышка всего кольца
 	// одним цветом уровня, проценты на панели-часах. Звук ПЕРВЫМ: Flash
 	// синхронен до первого кадра (rebind), спад дорисовывается в рендере —
@@ -567,6 +541,35 @@ func pactlOutput(args ...string) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// getSinkPct — текущая физическая громкость default sink в процентах
+// 0..VOLUME_MAX_PCT, -1 = не узнали.
+func getSinkPct() int {
+	out, err := pactlOutput("get-sink-volume", "@DEFAULT_SINK@")
+	if err != nil {
+		return -1
+	}
+	for _, f := range strings.Fields(out) {
+		if strings.HasSuffix(f, "%") {
+			if v, err := strconv.Atoi(strings.TrimSuffix(f, "%")); err == nil {
+				return v
+			}
+		}
+	}
+	return -1
+}
+
+// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
+// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама.
+func setSinkPct(p int) {
+	if p < 0 {
+		p = 0
+	}
+	if p > VOLUME_MAX_PCT {
+		p = VOLUME_MAX_PCT
+	}
+	pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 }
 
 // toVisual — физическая громкость sink (0..VOLUME_MAX_PCT) → визуальная
