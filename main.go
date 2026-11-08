@@ -459,9 +459,9 @@ func main() {
 					setSinkPct(int(math.Round(e.Float("volume") * VOLUME_MAX_PCT)))
 				}
 			case "zeroconf":
-				if e.Str("status") == "connected" {
-					rg.SetLive(true)
-				}
+				// upstream: status "getting_started" | "connected"
+				// (peripheral_api.md:127) — connected снимает noconn
+				rg.SetLive(e.Str("status") == "connected")
 			case "muted":
 				// звук — на подтверждённую смену состояния (кнопка, голос, HA)
 				newMuted := e.Bool("muted")
