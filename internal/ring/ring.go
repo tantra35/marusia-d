@@ -27,7 +27,7 @@ const (
 	leds          = 12
 
 	renderInterval    = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
-	breathePeriod     = 1500 * time.Millisecond
+	breathePeriod     = 800 * time.Millisecond  // интервал дыхания = вспышке
 	blinkPeriod       = 500 * time.Millisecond
 	FLASH_MS          = 800 * time.Millisecond   // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
