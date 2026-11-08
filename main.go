@@ -61,6 +61,7 @@ const (
 	SOUND_MIC_OFF     = "/etc/sounds/05_mic_on_to_mic_off.flac"
 	SOUND_MIC_ON      = "/etc/sounds/06_mic_off_to_mic_on.flac"
 	FLASH_MS          = 800 * time.Millisecond // вспышка громкости: дыхание 0.8 с
+	WAKE_FLASH_MS     = 400 * time.Millisecond // вспышка wake: короткий синий импульс
 	VOLUME_MAX_PCT    = 150                    // физическая громкость sink, больше нельзя
 	VOLUME_VISUAL_MAX = 100                    // визуальная шкала (кольцо, панель): 0..100
 )
@@ -257,7 +258,8 @@ func main() {
 			clk.ShowVolume(pct)
 		}
 	}
-	// абсолютная физическая громкость sink 0..VOLUME_MAX_PCT (не доля 0..1!)
+	// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
+	// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама
 	setSinkPct := func(p int) {
 		if p < 0 {
 			p = 0
@@ -331,7 +333,7 @@ func main() {
 					if v > VOLUME_VISUAL_MAX {
 						v = VOLUME_VISUAL_MAX
 					}
-					setSinkPct((v*VOLUME_MAX_PCT + 50) / 100)
+					setSinkPct((v*VOLUME_MAX_PCT + 50) / 100) // v∈0..100 → ровно 0..150
 					volFeedback(v)
 				default:
 					log.Printf("volapi: неизвестная команда %q", fields[0])
@@ -353,23 +355,24 @@ func main() {
 			}
 			return
 		}
-		// локальная ветка: шаг ±10% с потолком VOLUME_MAX_PCT.
+		// локальная ветка: шаг ±10% считает сам демон — один get + один set
+		// (setSinkPct сам режет в 0..VOLUME_MAX_PCT). get вернул -1 = PA не
+		// ответил: и set упадёт так же (тот же pactl, тот же сокет), не шагаем.
 		pct := getSinkPct()
-		if pct >= 0 {
-			if (up && pct >= VOLUME_MAX_PCT) || (!up && pct <= 0) {
-				volFeedback(toVisual(pct)) // на пределе — оранжевый отклик, не шагаем
-				return
-			}
+		if pct < 0 {
+			return
 		}
 		if up {
-			pactl("set-sink-volume", "@DEFAULT_SINK@", "+10%")
+			pct += 10
 		} else {
-			pactl("set-sink-volume", "@DEFAULT_SINK@", "-10%")
+			pct -= 10
 		}
-		if pct = getSinkPct(); pct > VOLUME_MAX_PCT {
-			setSinkPct(VOLUME_MAX_PCT) // PA умеет >150% — режем потолком
+		if pct > VOLUME_MAX_PCT { // 145+10=155 → потолок
 			pct = VOLUME_MAX_PCT
+		} else if pct < 0 { // 5-10=-5 → пол
+			pct = 0
 		}
+		setSinkPct(pct)
 		volFeedback(toVisual(pct))
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
@@ -451,7 +454,7 @@ func main() {
 			case "snapshot":
 				rg.SetSnapshot(e.Bool("muted"))
 				if e.Has("volume") {
-					// upstream: volume — доля 0.0..1.0 от максимума колонки
+					// volume — доля 0.0..1.0 от максимума колонки
 					// (150%); sink — источник истины по громкости колонки,
 					// синхронизируем при коннекте в физической шкале
 					setSinkPct(int(math.Round(e.Float("volume") * VOLUME_MAX_PCT)))
@@ -473,6 +476,9 @@ func main() {
 				rg.SetMuted(newMuted)
 			case "wake_word_detected":
 				rg.SetDialog("wake")
+				// API: chime уже играет, у нас нет wake-анимации — короткая
+				// синяя вспышка (peripheral_api.md:111 предлагает анимацию)
+				rg.Flash(ring.Color{R: ring.LISTEN_RGB[0], G: ring.LISTEN_RGB[1], B: ring.LISTEN_RGB[2]}, WAKE_FLASH_MS)
 			case "listening":
 				rg.SetDialog("listening")
 				if clk != nil {
@@ -503,6 +509,11 @@ func main() {
 				// колонки (150%); sink — в физической шкале, в отклик —
 				// визуальные 0..100 (toVisual)
 				pct := int(math.Round(e.Float("volume") * VOLUME_MAX_PCT))
+				if pct > VOLUME_MAX_PCT { // volume чужой — кламп и для отклика
+					pct = VOLUME_MAX_PCT
+				} else if pct < 0 {
+					pct = 0
+				}
 				setSinkPct(pct)
 				volFeedback(toVisual(pct))
 			case "light_command":
