@@ -429,11 +429,12 @@ func main() {
 			case "snapshot":
 				rg.SetSnapshot(e.Bool("muted"))
 				if e.Has("volume") {
-					// volume — доля 0.0..1.0 от максимума колонки
-					// (150%); sink — источник истины по громкости колонки,
-					// синхронизируем при коннекте: fromFraction — сразу
+					// volume — доля 0.0..1.0 от максимума колонки (150%),
+					// ×100 — это визуальные 0..100 (шкала toVisual);
+					// sink — источник истины по громкости колонки,
+					// синхронизируем при коннекте: fromVisual — сразу
 					// физическая шкала на сетке инкремента клавиш
-					setSinkPct(fromFraction(e.Float("volume")))
+					setSinkPct(fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX))))
 				}
 			case "zeroconf":
 				// upstream: status "getting_started" | "connected"
@@ -478,10 +479,10 @@ func main() {
 				})
 			case "volume_changed":
 				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
-				// колонки (150%); fromFraction — физическая на сетке
-				// инкремента клавиш (кламп внутри), в отклик — визуальные
-				// 0..100 (toVisual)
-				pct := fromFraction(e.Float("volume"))
+				// колонки (150%), ×100 — визуальные 0..100 (шкала
+				// toVisual); fromVisual — физическая на сетке инкремента
+				// клавиш (кламп внутри), в отклик — визуальные 0..100
+				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
 				volFeedback(toVisual(pct))
 			case "light_command":
@@ -586,16 +587,9 @@ func snapPct(p int) int {
 	return (p + VOLUME_STEP_PCT/2) / VOLUME_STEP_PCT * VOLUME_STEP_PCT
 }
 
-// fromFraction — громкость LVA (доля 0.0..1.0 от максимума колонки,
-// peripheral_api.md) → физическая 0..VOLUME_MAX_PCT на сетке клавиш.
-// Округление к ближайшему — math.Round.
-func fromFraction(f float64) int {
-	return snapPct(int(math.Round(f * VOLUME_MAX_PCT)))
-}
-
-// fromVisual — визуальная громкость 0..VOLUME_VISUAL_MAX (слайдер DLNA
-// через volapi SET) → физическая на сетке клавиш. Округление к ближайшему
-// целочисленным +50 перед делением (int-вход, деление в Go дробь отбрасывает:
+// fromVisual — громкость в ВИЗУАЛЬНОЙ шкале 0..VOLUME_VISUAL_MAX →
+// физическая на сетке клавиш. Округление к ближайшему целочисленным +50
+// перед делением (int-вход, деление в Go дробь отбрасывает:
 // 47*150/100 = 70, а с +50 честные 70.5 → 71).
 func fromVisual(v int) int {
 	return snapPct((v*VOLUME_MAX_PCT + 50) / VOLUME_VISUAL_MAX)
