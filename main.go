@@ -63,6 +63,7 @@ const (
 	FLASH_MS          = 800 * time.Millisecond // вспышка громкости: дыхание 0.8 с
 	WAKE_FLASH_MS     = 800 * time.Millisecond // вспышка wake: синий импульс, как у громкости
 	VOLUME_MAX_PCT    = 150                    // физическая громкость sink, больше нельзя
+	VOLUME_STEP_PCT   = 10                     // инкремент клавиш громкости — сетка громкости кратна ему
 	VOLUME_VISUAL_MAX = 100                    // визуальная шкала (кольцо, панель): 0..100
 )
 
@@ -307,8 +308,11 @@ func main() {
 					if v > VOLUME_VISUAL_MAX {
 						v = VOLUME_VISUAL_MAX
 					}
-					setSinkPct((v*VOLUME_MAX_PCT + 50) / 100) // v∈0..100 → ровно 0..150
-					volFeedback(v)
+					// v∈0..100 → 0..150 → на сетку инкремента клавиш;
+					// отклик — от итогового (снапнутого) значения
+					p := snapPct((v*VOLUME_MAX_PCT + 50) / 100)
+					setSinkPct(p)
+					volFeedback(toVisual(p))
 				default:
 					log.Printf("volapi: неизвестная команда %q", fields[0])
 				}
@@ -329,17 +333,19 @@ func main() {
 			}
 			return
 		}
-		// локальная ветка: шаг ±10% считает сам демон — один get + один set
-		// (setSinkPct сам режет в 0..VOLUME_MAX_PCT). get вернул -1 = PA не
-		// ответил: и set упадёт так же (тот же pactl, тот же сокет), не шагаем.
+		// локальная ветка: шаг ±VOLUME_STEP_PCT считает сам демон — один get +
+		// один set (setSinkPct сам режет в 0..VOLUME_MAX_PCT). get вернул -1 =
+		// PA не ответил: и set упадёт так же (тот же pactl, тот же сокет),
+		// не шагаем.
 		pct := getSinkPct()
 		if pct < 0 {
 			return
 		}
+		pct = snapPct(pct) // чужая установка могла оставить значение мимо сетки
 		if up {
-			pct += 10
+			pct += VOLUME_STEP_PCT
 		} else {
-			pct -= 10
+			pct -= VOLUME_STEP_PCT
 		}
 		if pct > VOLUME_MAX_PCT { // 145+10=155 → потолок
 			pct = VOLUME_MAX_PCT
@@ -429,8 +435,9 @@ func main() {
 				if e.Has("volume") {
 					// volume — доля 0.0..1.0 от максимума колонки
 					// (150%); sink — источник истины по громкости колонки,
-					// синхронизируем при коннекте в физической шкале
-					setSinkPct(int(math.Round(e.Float("volume") * VOLUME_MAX_PCT)))
+					// синхронизируем при коннекте в физической шкале,
+					// приводя к сетке инкремента клавиш
+					setSinkPct(snapPct(int(math.Round(e.Float("volume") * VOLUME_MAX_PCT))))
 				}
 			case "zeroconf":
 				// upstream: status "getting_started" | "connected"
@@ -475,14 +482,10 @@ func main() {
 				})
 			case "volume_changed":
 				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
-				// колонки (150%); sink — в физической шкале, в отклик —
-				// визуальные 0..100 (toVisual)
-				pct := int(math.Round(e.Float("volume") * VOLUME_MAX_PCT))
-				if pct > VOLUME_MAX_PCT { // volume чужой — кламп и для отклика
-					pct = VOLUME_MAX_PCT
-				} else if pct < 0 {
-					pct = 0
-				}
+				// колонки (150%); к сетке инкремента клавиш приводит
+				// snapPct (кламп 0..150 внутри), в отклик — визуальные
+				// 0..100 (toVisual)
+				pct := snapPct(int(math.Round(e.Float("volume") * VOLUME_MAX_PCT)))
 				setSinkPct(pct)
 				volFeedback(toVisual(pct))
 			case "light_command":
@@ -570,6 +573,21 @@ func setSinkPct(p int) {
 		p = VOLUME_MAX_PCT
 	}
 	pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
+}
+
+// snapPct — округление громкости к ближайшей ступени сетки VOLUME_STEP_PCT
+// (инкремент клавиш) с клампом 0..VOLUME_MAX_PCT. Все писатели sink
+// подставляют его: иначе чужая абсолютная установка (слайдер DLNA, volume
+// от LVA) оставляет значение мимо сетки, и шаг ±VOLUME_STEP_PCT с клавиш
+// уезжает с неё (73+10=83 — дальше кратности 10 уже не будет).
+func snapPct(p int) int {
+	if p < 0 {
+		p = 0
+	}
+	if p > VOLUME_MAX_PCT {
+		p = VOLUME_MAX_PCT
+	}
+	return (p + VOLUME_STEP_PCT/2) / VOLUME_STEP_PCT * VOLUME_STEP_PCT
 }
 
 // toVisual — физическая громкость sink (0..VOLUME_MAX_PCT) → визуальная
