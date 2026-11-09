@@ -306,9 +306,10 @@ func main() {
 						return
 					}
 					// v∈0..100 → 0..150 → на сетку инкремента клавиш
-					// (кламп диапазона внутри snapPct);
+					// (кламп диапазона внутри snapPct); перевод шкалы —
+					// тем же math.Round, что в snapshot/volume_changed,
 					// отклик — от итогового (снапнутого) значения
-					p := snapPct((v*VOLUME_MAX_PCT + 50) / 100)
+					p := snapPct(int(math.Round(float64(v) * VOLUME_MAX_PCT / VOLUME_VISUAL_MAX)))
 					setSinkPct(p)
 					volFeedback(toVisual(p))
 				default:
