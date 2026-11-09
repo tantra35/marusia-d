@@ -252,7 +252,7 @@ func main() {
 	//   GET          → визуальные 0..100 (текущий sink);
 	//   SET <0..100> → sink = round(v*1.5), отклик кольцо/панель/звук.
 	// Шкала: визуальная 0..VOLUME_VISUAL_MAX ↔ физическая 0..VOLUME_MAX_PCT.
-	volapiServe := func(addr string) {
+	go func(addr string) {
 		if addr == "" {
 			return
 		}
@@ -316,8 +316,7 @@ func main() {
 				}
 			}(conn)
 		}
-	}
-	go volapiServe(*volapiAddr)
+	}(*volapiAddr)
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
 	// (5% по умолчанию, --peripheral-volume-step), результат прилетит
