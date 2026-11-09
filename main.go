@@ -295,7 +295,7 @@ func main() {
 					if p > VOLUME_MAX_PCT {
 						p = VOLUME_MAX_PCT
 					}
-					fmt.Fprintf(conn, "%d\n", (p*100+75)/VOLUME_MAX_PCT)
+					fmt.Fprintf(conn, "%d\n", (p*100+VOLUME_MAX_PCT/2)/VOLUME_MAX_PCT)
 				case "SET":
 					if len(fields) < 2 {
 						return
