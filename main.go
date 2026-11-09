@@ -305,10 +305,8 @@ func main() {
 						log.Printf("volapi: SET %q: не число", fields[1])
 						return
 					}
-					if v > VOLUME_VISUAL_MAX {
-						v = VOLUME_VISUAL_MAX
-					}
-					// v∈0..100 → 0..150 → на сетку инкремента клавиш;
+					// v∈0..100 → 0..150 → на сетку инкремента клавиш
+					// (кламп диапазона внутри snapPct);
 					// отклик — от итогового (снапнутого) значения
 					p := snapPct((v*VOLUME_MAX_PCT + 50) / 100)
 					setSinkPct(p)
