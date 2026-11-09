@@ -290,7 +290,7 @@ func main() {
 				case "GET":
 					p := getSinkPct()
 					if p < 0 {
-						return
+						p = 0
 					}
 					if p > VOLUME_MAX_PCT {
 						p = VOLUME_MAX_PCT
