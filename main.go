@@ -295,7 +295,7 @@ func main() {
 					if p > VOLUME_MAX_PCT {
 						p = VOLUME_MAX_PCT
 					}
-					fmt.Fprintf(conn, "%d\n", (p*100+VOLUME_MAX_PCT/2)/VOLUME_MAX_PCT)
+					fmt.Fprintf(conn, "%d\n", toVisual(p))
 				case "SET":
 					if len(fields) < 2 {
 						return
@@ -597,13 +597,15 @@ func fromVisual(v int) int {
 
 // toVisual — физическая громкость sink (0..VOLUME_MAX_PCT) → визуальная
 // шкала 0..VOLUME_VISUAL_MAX: на кольце и панели громкость всегда 0..100,
-// физические 150% показываются как 100. Отрицательное (-1 = «не узнали»)
-// проходит насквозь без перевода.
+// физические 150% показываются как 100. Округление к ближайшему
+// (+VOLUME_MAX_PCT/2 — половина знаменателя), НЕ отсечение: иначе
+// визуальные значения системно занижаются (56.67 → 56). Отрицательное
+// (-1 = «не узнали») проходит насквозь без перевода.
 func toVisual(pct int) int {
 	if pct < 0 {
 		return -1
 	}
-	return pct * VOLUME_VISUAL_MAX / VOLUME_MAX_PCT
+	return (pct*VOLUME_VISUAL_MAX + VOLUME_MAX_PCT/2) / VOLUME_MAX_PCT
 }
 
 // volumeColor — цвет вспышки громкости, двухсегментный градиент по
