@@ -35,14 +35,15 @@ const (
 
 // Палитра сцен (RGB). var, не const: литералы массивов в Go константами не бывают.
 var (
-	Off         = Color{}                   // чёрный (используется main)
-	White       = Color{255, 255, 255}      // (main: цвет по умолчанию)
-	MUTED_RGB   = [3]byte{0x8C, 0x00, 0x00} // приглушённый красный
-	LISTEN_RGB  = [3]byte{0x00, 0x3C, 0xFF} // синий
-	THINK_RGB   = [3]byte{0x96, 0x28, 0xFF} // фиолетовый
-	SPEAK_RGB   = [3]byte{0x00, 0xAA, 0xE6} // голубой
-	ERROR_COLOR = Color{255, 0, 0}          // ошибка пайплайна (вспышка)
-	noconnRGB   = [3]byte{0x64, 0x00, 0x00} // нет связи с LVA — тусклый красный
+	Off          = Color{}                   // чёрный (используется main)
+	White        = Color{255, 255, 255}      // (main: цвет по умолчанию)
+	MUTED_RGB    = [3]byte{0x8C, 0x00, 0x00} // приглушённый красный
+	LISTEN_RGB   = [3]byte{0x00, 0x3C, 0xFF} // синий (дыхание listening)
+	LISTEN_COLOR = Color{0x00, 0x3C, 0xFF}   // синий (wake-вспышка)
+	THINK_RGB    = [3]byte{0x96, 0x28, 0xFF} // фиолетовый
+	SPEAK_RGB    = [3]byte{0x00, 0xAA, 0xE6} // голубой
+	ERROR_COLOR  = Color{255, 0, 0}          // ошибка пайплайна (вспышка)
+	noconnRGB    = [3]byte{0x64, 0x00, 0x00} // нет связи с LVA — тусклый красный
 )
 
 // Color — RGB 0..255.
