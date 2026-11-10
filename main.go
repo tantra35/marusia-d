@@ -58,8 +58,6 @@ const (
 // звук отклика на кнопки громкости (кладка в rootfs: /etc/sounds)
 const (
 	SOUND_VOLUME      = "/etc/sounds/13_volume_voice.flac"
-	SOUND_MIC_OFF     = "/etc/sounds/05_mic_on_to_mic_off.flac"
-	SOUND_MIC_ON      = "/etc/sounds/06_mic_off_to_mic_on.flac"
 	FLASH_MS          = 800 * time.Millisecond // вспышка громкости: дыхание 0.8 с
 	WAKE_FLASH_MS     = 800 * time.Millisecond // вспышка wake: синий импульс, как у громкости
 	VOLUME_MAX_PCT    = 150                    // физическая громкость sink, больше нельзя
