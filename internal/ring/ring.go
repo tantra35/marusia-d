@@ -29,7 +29,6 @@ const (
 	renderInterval    = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
 	breathePeriod     = 800 * time.Millisecond  // интервал дыхания = вспышке
 	spinPeriod        = 1200 * time.Millisecond // оборот бегущего диода (thinking)
-	blinkPeriod       = 500 * time.Millisecond
 	FLASH_MS          = 800 * time.Millisecond   // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
 )
@@ -54,7 +53,6 @@ const (
 	cmdSetDialog = iota
 	cmdSetMuted
 	cmdGetMuted
-	cmdSetError
 	cmdSetLive
 	cmdSetSnapshot
 	cmdSetHA
@@ -83,7 +81,6 @@ type Ring struct {
 	cmdCh chan ringCmd // команды актору; каждая несёт свой reply-канал
 
 	dialog   string // "" | listening | thinking | speaking
-	errorT   bool
 	muted    bool
 	lvaSeen  bool // было хоть одно живое соединение с LVA
 	lvaLive  bool // соединение открыто сейчас
@@ -142,12 +139,6 @@ func (r *Ring) Muted() bool {
 	return r.send(&cmd).(bool)
 }
 
-// SetError — мигание ошибки диалога (сбрасывается по таймеру).
-func (r *Ring) SetError(on bool) {
-	cmd := ringCmd{kind: cmdSetError, b: on, reply: make(chan any, 1)}
-	r.send(&cmd)
-}
-
 // SetLive — LVA-соединение открыто/закрыто.
 func (r *Ring) SetLive(live bool) {
 	cmd := ringCmd{kind: cmdSetLive, b: live, reply: make(chan any, 1)}
@@ -186,14 +177,12 @@ func (r *Ring) Flash(c Color, d time.Duration) {
 	r.send(&cmd)
 }
 
-// resolve — вычислить сцену из состояния: solid (HA) > error > noconn >
+// resolve — вычислить сцену из состояния: solid (HA) > noconn >
 // muted > диалог. Чистая функция — состояние не меняет.
 func (r *Ring) resolve() string {
 	switch {
 	case r.haActive:
 		return "solid"
-	case r.errorT:
-		return "error"
 	case r.lvaSeen && !r.lvaLive:
 		return "noconn"
 	case r.muted:
@@ -215,8 +204,6 @@ func (r *Ring) exec(cmd *ringCmd) any {
 		r.muted = cmd.b
 	case cmdGetMuted:
 		return r.muted
-	case cmdSetError:
-		r.errorT = cmd.b
 	case cmdSetLive:
 		r.lvaLive = cmd.b
 	case cmdSetSnapshot:
@@ -288,14 +275,6 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 			px[i] = mul(MUTED_RGB, dim)
 		}
 		return fmt.Sprintf("muted@%.2f", dim), px, false
-	case "error":
-		on := now.UnixMilli()%int64(blinkPeriod) < int64(blinkPeriod)/2
-		for i := range px {
-			if on {
-				px[i] = mul(ERROR_RGB, dim)
-			}
-		}
-		return "", px, true
 	case "noconn":
 		b := breathe(now, breathePeriod) * 0.4 // тускло
 		for i := range px {

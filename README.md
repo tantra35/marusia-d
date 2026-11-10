@@ -35,18 +35,18 @@ LVA подключается к ней сам. Колонка не знает а
 
 | Событие LVA | Сцена |
 |---|---|
-| `wake_word_detected` | wake — две зелёные вспышки |
-| `listening` | listening — синяя комета по кольцу |
-| `thinking` | thinking — фиолетовая вращающаяся дуга |
-| `tts_speaking` | speaking — голубой пульс |
-| `tts_finished` / `idle` | возврат к сцене MPD |
+| `wake_word_detected` | wake — синяя вспышка 0.8 с (LISTEN_RGB) |
+| `listening` | listening — синее дыхание |
+| `thinking` | thinking — фиолетовое кольцо в пол-яркости + бегущий по кругу диод (оборот 1.2 с) |
+| `tts_speaking` | speaking — голубое дыхание |
+| `tts_finished` / `idle` | гашение диалога (off) |
 | `snapshot` | muted (сцена) + `volume` 0.0–1.0 — синхронизация громкости sink при коннекте |
-| `muted true` | muted — тускло-красный статичный |
-| `pipeline_error` | error — три красные вспышки |
+| `muted true` | muted — тускло-красный статичный (звук мьюта играет LVA) |
+| `pipeline_error` | красная вспышка 1.6 с (overlay поверх любых сцен; звук ошибки играет LVA) |
 | обрыв связи | noconn — тёмно-красное дыхание (после первого удачного коннекта) |
 | `volume_changed` | `{"volume": 0.0–1.0}` (upstream) → громкость системного sink (sink = volume×150%) + вспышка цветом уровня и звук |
 
-Приоритет сцен: `solid (HA) > error > noconn > muted > диалог > MPD`.
+Приоритет сцен: `solid (HA) > noconn > muted > диалог`; вспышки (громкость/wake/ошибка) — overlay поверх всего.
 
 Обратно (сенсорные кнопки): 114/115 → при подключённом LVA — upstream-команды
 `volume_up`/`volume_down` (LVA меняет громкость, шлёт `volume_changed`, sink
