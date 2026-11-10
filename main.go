@@ -440,43 +440,37 @@ func main() {
 				// upstream: status "getting_started" | "connected"
 				// (peripheral_api.md:127) — connected снимает noconn
 				rg.SetLive(e.Str("status") == "connected")
+
 			case "muted":
-				// звук — на подтверждённую смену состояния (кнопка, голос, HA)
+				// звук мьюта играет LVA сам (satellite.py:557-572: _set_muted
+				// — общая воронка и для кнопки, и для тумблера HA), демону
+				// остаётся сцена кольца
 				newMuted := e.Bool("muted")
-				if newMuted != rg.Muted() {
-					if newMuted {
-						playSound(SOUND_MIC_OFF)
-					} else {
-						playSound(SOUND_MIC_ON)
-					}
-				}
 				rg.SetMuted(newMuted)
+
 			case "wake_word_detected":
 				// API: chime уже играет, у нас нет wake-анимации — короткая
 				// синяя вспышка (peripheral_api.md:111 предлагает анимацию)
 				rg.Flash(ring.Color{R: ring.LISTEN_RGB[0], G: ring.LISTEN_RGB[1], B: ring.LISTEN_RGB[2]}, WAKE_FLASH_MS)
+
 			case "listening":
 				rg.SetDialog("listening")
-				if clk != nil {
-					clk.PlayFaces([]string{"curious"})
-				}
+
 			case "thinking":
 				rg.SetDialog("thinking")
-				if clk != nil {
-					clk.PlayFaces([]string{"wink"})
-				}
+
 			case "tts_speaking":
 				rg.SetDialog("speaking")
-				if clk != nil {
-					clk.PlayFaces([]string{"neutral"})
-				}
+
 			case "tts_finished", "idle":
 				rg.SetDialog("")
+
 			case "pipeline_error":
 				rg.SetError(true)
 				time.AfterFunc(1600*time.Millisecond, func() {
 					rg.SetError(false)
 				})
+
 			case "volume_changed":
 				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
 				// колонки (150%), ×100 — визуальные 0..100 (шкала
@@ -485,6 +479,7 @@ func main() {
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
 				volFeedback(toVisual(pct))
+
 			case "light_command":
 				lc := e.LightCommand()
 				if lc.ObjectID != "ring" {
