@@ -96,8 +96,9 @@ type spiXfer struct {
 	pad   uint16
 }
 
+// _IOC(_IOC_WRITE, 'k', 0, n*32) — SPI_IOC_MESSAGE(n); nr = 0.
 func iocMessage(n int) uintptr {
-	return 0x40000000 | uintptr(n*32)<<16 | 0x6B<<8 | 0
+	return 0x40000000 | uintptr(n*32)<<16 | 0x6B<<8
 }
 
 // draw — rebind + открыть узел + отправить кадр. Блокирует ~30–60 мс.
