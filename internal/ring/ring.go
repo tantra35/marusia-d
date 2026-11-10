@@ -28,6 +28,7 @@ const (
 
 	renderInterval    = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
 	breathePeriod     = 800 * time.Millisecond  // интервал дыхания = вспышке
+	spinPeriod        = 1200 * time.Millisecond // оборот бегущего диода (thinking)
 	blinkPeriod       = 500 * time.Millisecond
 	FLASH_MS          = 800 * time.Millisecond   // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
@@ -301,19 +302,29 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 			px[i] = mul(noconnRGB, b)
 		}
 		return "", px, true
-	case "listening", "thinking", "speaking":
+	case "listening", "speaking":
 		b := breathe(now, breathePeriod) * r.scale
 		var c [3]byte
-		switch scene {
-		case "listening":
+		if scene == "listening" {
 			c = LISTEN_RGB
-		case "thinking":
-			c = THINK_RGB
-		default:
+		} else {
 			c = SPEAK_RGB
 		}
 		for i := range px {
 			px[i] = mul(c, b)
+		}
+		return "", px, true
+	case "thinking":
+		// фон кольца в пол-яркости + один диод на 100%, бегущий по кругу
+		bg := mul(THINK_RGB, 0.5*r.scale)
+		ms := now.UnixMilli() % int64(spinPeriod/time.Millisecond)
+		pos := int(ms) * leds / int(spinPeriod/time.Millisecond)
+		for i := range px {
+			if i == pos {
+				px[i] = mul(THINK_RGB, r.scale)
+			} else {
+				px[i] = bg
+			}
 		}
 		return "", px, true
 	default: // off — чёрный

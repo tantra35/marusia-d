@@ -108,6 +108,45 @@ func TestFrameAnimationsBreathing(t *testing.T) {
 	}
 }
 
+// TestFrameThinkingSpinner — thinking: фон в пол-яркости + один диод на
+// полную, бегущий по кругу (позиция меняется со временем).
+func TestFrameThinkingSpinner(t *testing.T) {
+	r := New("/dev/null", 12)
+	r.dialog = "thinking"
+	r.scale = 1
+
+	now := time.Now()
+	key, px, animated := r.frame(now)
+	if key != "" || !animated {
+		t.Fatalf("key = %q animated = %v, want анимацию вращения", key, animated)
+	}
+	full, runner := 0, -1
+	for i, p := range px {
+		if p == mul(THINK_RGB, 1) {
+			full, runner = full+1, i
+		}
+	}
+	if full != 1 {
+		t.Fatalf("диодов 100%% яркости = %d, want ровно один", full)
+	}
+	for i, p := range px {
+		if i != runner && p != mul(THINK_RGB, 0.5) {
+			t.Fatalf("px[%d] = %v, want фон в пол-яркости %v", i, p, mul(THINK_RGB, 0.5))
+		}
+	}
+	// через полпериода бегущий диод переместился (позиция сместилась на пол-кольца)
+	_, px2, _ := r.frame(now.Add(spinPeriod / 2))
+	full2 := 0
+	for _, p := range px2 {
+		if p == mul(THINK_RGB, 1) {
+			full2++
+		}
+	}
+	if full2 != 1 || px2[runner] == mul(THINK_RGB, 1) {
+		t.Fatalf("через полпериода диод не сместился: runner=%d, full2=%d", runner, full2)
+	}
+}
+
 func TestFrameOff(t *testing.T) {
 	r := New("/dev/null", 12)
 	r.scale = 1
