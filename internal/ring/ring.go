@@ -26,23 +26,23 @@ const (
 	DefaultDevice = "/dev/spidev0.0"
 	leds          = 12
 
-	renderInterval    = 40 * time.Millisecond // тик отрисовки (~25 fps сверху)
+	renderInterval    = 40 * time.Millisecond   // тик отрисовки (~25 fps сверху)
 	breathePeriod     = 800 * time.Millisecond  // интервал дыхания = вспышке
 	spinPeriod        = 1200 * time.Millisecond // оборот бегущего диода (thinking)
-	FLASH_MS          = 800 * time.Millisecond   // вспышка громкости: полный спад
+	FLASH_MS          = 800 * time.Millisecond  // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
 )
 
 // Палитра сцен (RGB). var, не const: литералы массивов в Go константами не бывают.
 var (
-	Off        = Color{}                   // чёрный (используется main)
-	White      = Color{255, 255, 255}      // (main: цвет по умолчанию)
-	MUTED_RGB  = [3]byte{0x8C, 0x00, 0x00} // приглушённый красный
-	LISTEN_RGB = [3]byte{0x00, 0x3C, 0xFF} // синий
-	THINK_RGB  = [3]byte{0x96, 0x28, 0xFF} // фиолетовый
-	SPEAK_RGB  = [3]byte{0x00, 0xAA, 0xE6} // голубой
-	ERROR_RGB  = [3]byte{0xFF, 0x00, 0x00} // ошибка
-	noconnRGB  = [3]byte{0x64, 0x00, 0x00} // нет связи с LVA — тусклый красный
+	Off         = Color{}                   // чёрный (используется main)
+	White       = Color{255, 255, 255}      // (main: цвет по умолчанию)
+	MUTED_RGB   = [3]byte{0x8C, 0x00, 0x00} // приглушённый красный
+	LISTEN_RGB  = [3]byte{0x00, 0x3C, 0xFF} // синий
+	THINK_RGB   = [3]byte{0x96, 0x28, 0xFF} // фиолетовый
+	SPEAK_RGB   = [3]byte{0x00, 0xAA, 0xE6} // голубой
+	ERROR_COLOR = Color{255, 0, 0}          // ошибка пайплайна (вспышка)
+	noconnRGB   = [3]byte{0x64, 0x00, 0x00} // нет связи с LVA — тусклый красный
 )
 
 // Color — RGB 0..255.
@@ -93,9 +93,9 @@ type Ring struct {
 	overlayDur   time.Duration // её полная длительность (спад)
 	overlayTt    time.Time     // когда вспышка истекает; zero = нет
 
-	lastDrawn       string    // ключ последнего нарисованного статичного кадра
-	lastAnimDraw    time.Time // время последнего анимационного кадра (прореживание)
-	pendingConfirm  bool      // после анимации статичный кадр перерисовать ещё раз
+	lastDrawn      string    // ключ последнего нарисованного статичного кадра
+	lastAnimDraw   time.Time // время последнего анимационного кадра (прореживание)
+	pendingConfirm bool      // после анимации статичный кадр перерисовать ещё раз
 
 	// DMA-буферы: выделяются один раз и живут вечно — их физические
 	// страницы не возвращаются ядру и не переиспользуются, что исключает

@@ -60,10 +60,10 @@ const (
 	SOUND_VOLUME      = "/etc/sounds/13_volume_voice.flac"
 	FLASH_MS          = 800 * time.Millisecond  // вспышка громкости: дыхание 0.8 с
 	ERROR_FLASH_MS    = 1600 * time.Millisecond // красная вспышка ошибки пайплайна
-	WAKE_FLASH_MS     = 800 * time.Millisecond // вспышка wake: синий импульс, как у громкости
-	VOLUME_MAX_PCT    = 150                    // физическая громкость sink, больше нельзя
-	VOLUME_STEP_PCT   = 10                     // инкремент клавиш громкости — сетка громкости кратна ему
-	VOLUME_VISUAL_MAX = 100                    // визуальная шкала (кольцо, панель): 0..100
+	WAKE_FLASH_MS     = 800 * time.Millisecond  // вспышка wake: синий импульс, как у громкости
+	VOLUME_MAX_PCT    = 150                     // физическая громкость sink, больше нельзя
+	VOLUME_STEP_PCT   = 10                      // инкремент клавиш громкости — сетка громкости кратна ему
+	VOLUME_VISUAL_MAX = 100                     // визуальная шкала (кольцо, панель): 0..100
 )
 
 // mpdLink — переподключающийся клиент MPD. conn и watcher живут в своей
@@ -467,7 +467,7 @@ func main() {
 			case "pipeline_error":
 				// красная вспышка на 1.6 с (overlay поверх любых сцен,
 				// спад дорисовывается в рендере); «голос» ошибки играет LVA
-				rg.Flash(ring.Color{R: ring.ERROR_RGB[0], G: ring.ERROR_RGB[1], B: ring.ERROR_RGB[2]}, ERROR_FLASH_MS)
+				rg.Flash(ring.ERROR_COLOR, ERROR_FLASH_MS)
 
 			case "volume_changed":
 				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
