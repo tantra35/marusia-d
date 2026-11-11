@@ -63,8 +63,7 @@ const (
 	WAKE_FLASH_MS     = 800 * time.Millisecond  // вспышка wake: синий импульс, как у громкости
 	VOLUME_MAX_PCT    = 150                     // физическая громкость sink, больше нельзя
 	VOLUME_STEP_PCT   = 10                      // инкремент клавиш громкости — сетка громкости кратна ему
-	VOLUME_VISUAL_MAX = 100                   // визуальная шкала (кольцо, панель): 0..100
-	SINK_TTS          = "tts"                 // роль-сосед master'а в lva.pa: громкость LVA живёт здесь
+	VOLUME_VISUAL_MAX = 100                     // визуальная шкала (кольцо, панель): 0..100
 )
 
 // mpdLink — переподключающийся клиент MPD. conn и watcher живут в своей
@@ -306,10 +305,9 @@ func main() {
 						return
 					}
 					// v∈0..100: fromVisual — на сетку инкремента клавиш
-					// setSinkPct сам режет в 0..VOLUME_MAX_PCT
 					// (кламп внутри), отклик — от итогового значения
 					p := fromVisual(v)
-					setSinkPct("@DEFAULT_SINK@", p)
+					setSinkPct(p)
 					volFeedback(toVisual(p))
 				default:
 					log.Printf("volapi: неизвестная команда %q", fields[0])
@@ -349,7 +347,7 @@ func main() {
 		} else if pct < 0 { // 5-10=-5 → пол
 			pct = 0
 		}
-		setSinkPct("@DEFAULT_SINK@", pct)
+		setSinkPct(pct)
 		volFeedback(toVisual(pct))
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
@@ -430,12 +428,12 @@ func main() {
 			case "snapshot":
 				rg.SetSnapshot(e.Bool("muted"))
 				if e.Has("volume") {
-					// volume — доля 0.0..1.0 от максимума колонки (150%);
-					// громкость LVA — это роль tts (звук ассистента),
-					// sync при коннекте идёт В неё, master (музыка)
-					// не трогается; fromVisual — сразу физическая шкала
-					// на сетке инкремента клавиш
-					setSinkPct(SINK_TTS, fromVisual(int(math.Round(e.Float("volume")*VOLUME_VISUAL_MAX))))
+					// volume — доля 0.0..1.0 от максимума колонки (150%),
+					// ×100 — это визуальные 0..100 (шкала toVisual);
+					// sink — источник истины по громкости колонки,
+					// синхронизируем при коннекте: fromVisual — сразу
+					// физическая шкала на сетке инкремента клавиш
+					setSinkPct(fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX))))
 				}
 			case "zeroconf":
 				// upstream: status "getting_started" | "connected"
@@ -473,12 +471,11 @@ func main() {
 
 			case "volume_changed":
 				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
-				// колонки (150%). Громкость LVA — роль tts (звук ассистента
-				// по сети): пишем В неё, master (музыка) живёт своей
-				// жизнью; fromVisual — физическая на сетке инкремента
+				// колонки (150%), ×100 — визуальные 0..100 (шкала
+				// toVisual); fromVisual — физическая на сетке инкремента
 				// клавиш (кламп внутри), в отклик — визуальные 0..100
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
-				setSinkPct(SINK_TTS, pct)
+				setSinkPct(pct)
 				volFeedback(toVisual(pct))
 
 			case "light_command":
@@ -561,17 +558,16 @@ func getSinkPct() int {
 	return -1
 }
 
-// setSinkPct — абсолютная физическая громкость УКАЗАННОГО sink'а
-// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама. Писатели:
-// "@DEFAULT_SINK@" (мастер: кнопки/DLNA) и SINK_TTS (громкость LVA).
-func setSinkPct(sink string, p int) {
+// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
+// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама.
+func setSinkPct(p int) {
 	if p < 0 {
 		p = 0
 	}
 	if p > VOLUME_MAX_PCT {
 		p = VOLUME_MAX_PCT
 	}
-	pactl("set-sink-volume", sink, fmt.Sprintf("%d%%", p))
+	pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 }
 
 // snapPct — округление громкости к ближайшей ступени сетки VOLUME_STEP_PCT
