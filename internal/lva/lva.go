@@ -35,6 +35,10 @@ type Client struct {
 	conn *websocket.Conn
 }
 
+// sendTimeout — дедлайн на запись команды в WS: без него зависший сокет
+// блокирует Send (а с ней — потребителя keyCh) навсегда.
+const sendTimeout = 2 * time.Second
+
 // Send шлёт команду; молча пропускает, если связи нет.
 func (c *Client) Send(cmd string, data any) {
 	c.mu.Lock()
@@ -46,6 +50,7 @@ func (c *Client) Send(cmd string, data any) {
 	if data != nil {
 		m["data"] = data
 	}
+	c.conn.SetWriteDeadline(time.Now().Add(sendTimeout))
 	if err := c.conn.WriteJSON(m); err != nil {
 		log.Printf("lva: send %s: %v", cmd, err)
 	}
