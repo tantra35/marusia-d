@@ -324,13 +324,12 @@ func main() {
 			}(conn)
 		}
 	}(*volapiAddr)
-	// Обратная связь кнопок громкости при живом LVA — по РЕАЛЬНОМУ sink.
+	// Обратная связь кнопок громкости при живом LVA — по РЕАЛЬНОМУ изменению.
 	// Регулировка как была: volume_up/down уходит в LVA, шаг знает только
-	// он. volume_changed после применения пишет в volchangeCh реальную
-	// громкость sink; volStep ждёт её с таймером VOL_STEP_WAIT — зависнуть
-	// навсегда нельзя. Пока volStep не ждёт (голосовая команда), volume_changed
-	// не сумел записать в канал и даёт отклик сам — двойного отклика нет.
-	volchangeCh := make(chan int)
+	// он, отклик (звук+вспышка+панель) даёт volume_changed — как и раньше.
+	// volStep лишь ждёт подтверждения через volchangeCh с таймером
+	// VOL_STEP_WAIT, чтобы не вернуться раньше, чем громкость применилась.
+	volchangeCh := make(chan struct{})
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
 	// (5% по умолчанию, --peripheral-volume-step). Автономно: локальный
@@ -343,13 +342,8 @@ func main() {
 				lvaClient.Send("volume_down", nil)
 			}
 			select {
-			case p := <-volchangeCh:
-				if p > VOLUME_MAX_PCT {
-					p = VOLUME_MAX_PCT
-				}
-				volFeedback(toVisual(p))
+			case <-volchangeCh: // volume_changed приехал — громкость применилась
 			case <-time.After(VOL_STEP_WAIT):
-				// громкость за окно не изменилась — без отклика
 			}
 			return
 		}
@@ -516,18 +510,13 @@ func main() {
 				// клавиш (кламп внутри), в отклик — визуальные 0..100
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
-				// Кнопки ждут РЕАЛЬНУЮ громкость sink в volchangeCh —
-				// туда она попадает, только если volStep сейчас ждёт
-				// (небуферизованный канал). Не дождался получателя —
-				// это голосовая команда, отклик здесь же.
-				if real := getSinkPct(); real >= 0 {
-					select {
-					case volchangeCh <- real:
-						continue
-					default:
-					}
-				}
 				volFeedback(toVisual(pct))
+				// ждущий volStep разбудить; никого не ждёт (голосовая
+				// команда) — сигнал просто пропадает
+				select {
+				case volchangeCh <- struct{}{}:
+				default:
+				}
 
 			case "light_command":
 				lc := e.LightCommand()
