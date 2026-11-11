@@ -31,6 +31,12 @@ const (
 	spinPeriod        = 1200 * time.Millisecond // оборот бегущего диода (thinking)
 	FLASH_MS          = 800 * time.Millisecond  // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
+
+	// HA-эффекты (Цвет/Пульсация/Вращение): период 1.5 с, у пульса
+	// минимум почти до нуля (LVA-сцены дышат 800 мс с полом 0.15)
+	haPulsePeriod = 1500 * time.Millisecond
+	haSpinPeriod  = 1500 * time.Millisecond
+	haPulseMin    = 0.05
 )
 
 // Палитра сцен (RGB). var, не const: литералы массивов в Go константами не бывают.
@@ -267,17 +273,22 @@ func mul(c [3]byte, k float64) [3]byte {
 
 // breathe — фаза дыхания 0.15..1 (плавная синусоида).
 func breathe(now time.Time, period time.Duration) float64 {
+	return breatheMin(now, period, 0.15)
+}
+
+// breatheMin — фаза дыхания с заданным нижним пределом яркости.
+func breatheMin(now time.Time, period time.Duration, min float64) float64 {
 	s := math.Sin(2 * math.Pi * float64(now.UnixNano()%int64(period)) / float64(period))
-	return 0.15 + 0.85*(s+1)/2
+	return min + (1-min)*(s+1)/2
 }
 
 // spin — бегущий диод: фон цветом c на яркости k + один диод на полной
-// яркости c, позиция бежит по кругу за spinPeriod.
-func spin(now time.Time, c [3]byte, k, scale float64) [12][3]byte {
+// яркости c, позиция бежит по кругу за период period.
+func spin(now time.Time, c [3]byte, k, scale float64, period time.Duration) [12][3]byte {
 	var px [12][3]byte
 	bg := mul(c, k*scale)
-	ms := now.UnixMilli() % int64(spinPeriod/time.Millisecond)
-	pos := int(ms) * leds / int(spinPeriod/time.Millisecond)
+	ms := now.UnixMilli() % int64(period/time.Millisecond)
+	pos := int(ms) * leds / int(period/time.Millisecond)
 	for i := range px {
 		if i == pos {
 			px[i] = mul(c, scale)
@@ -341,20 +352,21 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 		}
 		return "", px, true
 	case "ha_pulse":
-		// дыхание (как listening) цветом из HA
-		b := breathe(now, breathePeriod) * r.scale
+		// дыхание цветом из HA: период 1.5 с, минимум почти до нуля
+		b := breatheMin(now, haPulsePeriod, haPulseMin) * r.scale
 		c := [3]byte{r.solid.R, r.solid.G, r.solid.B}
 		for i := range px {
 			px[i] = mul(c, b)
 		}
 		return "", px, true
 	case "ha_spin":
-		// бегущий диод цветом из HA; фон 30% (по просьбе: 50% слишком ярко)
+		// бегущий диод цветом из HA, оборот 1.5 с; фон 30% (по просьбе:
+		// 50% слишком ярко)
 		c := [3]byte{r.solid.R, r.solid.G, r.solid.B}
-		return "", spin(now, c, 0.3, r.scale), true
+		return "", spin(now, c, 0.3, r.scale, haSpinPeriod), true
 	case "thinking":
 		// фон кольца в пол-яркости + один диод на 100%, бегущий по кругу
-		return "", spin(now, THINK_RGB, 0.5, r.scale), true
+		return "", spin(now, THINK_RGB, 0.5, r.scale, spinPeriod), true
 	default: // off — чёрный
 		return "off", px, false
 	}

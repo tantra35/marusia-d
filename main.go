@@ -329,10 +329,7 @@ func main() {
 	// он, отклик (звук+вспышка+панель) даёт volume_changed — как и раньше.
 	// volStep лишь ждёт подтверждения через volchangeCh с таймером
 	// VOL_STEP_WAIT, чтобы не вернуться раньше, чем громкость применилась.
-	// Буфер 1: volume_changed кладёт сигнал и не ждёт читателя, а таймаут
-	// в записи — страховка от зависания, срабатывает только если буфер
-	// уже полон непрочитанным сигналом.
-	volchangeCh := make(chan struct{}, 1)
+	volchangeCh := make(chan struct{})
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
 	// (5% по умолчанию, --peripheral-volume-step). Автономно: локальный
@@ -514,11 +511,11 @@ func main() {
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
 				volFeedback(toVisual(pct))
-				// ждущий volStep разбудить; страховка от зависания —
-				// таймаут записи
+				// ждущий volStep разбудить; никого не ждёт (голосовая
+				// команда) — сигнал просто пропадает
 				select {
 				case volchangeCh <- struct{}{}:
-				case <-time.After(time.Second):
+				default:
 				}
 
 			case "light_command":

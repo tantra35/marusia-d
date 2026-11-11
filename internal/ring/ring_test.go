@@ -161,7 +161,7 @@ func TestFrameHAEffects(t *testing.T) {
 	if key != "" || !animated {
 		t.Fatalf("ha_pulse: key = %q animated = %v, want анимацию дыхания", key, animated)
 	}
-	if px[0] != mul([3]byte{255, 0, 0}, breathe(now, breathePeriod)) {
+	if px[0] != mul([3]byte{255, 0, 0}, breatheMin(now, haPulsePeriod, haPulseMin)) {
 		t.Fatalf("ha_pulse: px[0] = %v, want цвет из HA", px[0])
 	}
 
