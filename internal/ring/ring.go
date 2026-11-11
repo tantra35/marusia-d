@@ -268,9 +268,10 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 		for i := range px {
 			px[i] = mul(c, dim)
 		}
-		// dim в ключе: иначе SetScale на статичной сцене скипается дедупом
-		// (lastDrawn совпадёт, кадр с новой яркостью не уйдёт).
-		return fmt.Sprintf("solid@%.2f", dim), px, false
+		// dim и цвет в ключе: иначе SetScale/SetSolid на уже горящей
+		// статичной сцене скипается дедупом (lastDrawn совпадёт —
+		// смена цвета без смены сцены не доедет до диодов).
+		return fmt.Sprintf("solid@%.2f@%02x%02x%02x", dim, r.solid.R, r.solid.G, r.solid.B), px, false
 	case "muted":
 		for i := range px {
 			px[i] = mul(MUTED_RGB, dim)
