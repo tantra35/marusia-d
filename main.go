@@ -64,6 +64,7 @@ const (
 	VOLUME_MAX_PCT    = 150                     // физическая громкость sink, больше нельзя
 	VOLUME_STEP_PCT   = 10                      // инкремент клавиш громкости — сетка громкости кратна ему
 	VOLUME_VISUAL_MAX = 100                     // визуальная шкала (кольцо, панель): 0..100
+	VOL_STEP_WAIT     = 1500 * time.Millisecond // окно ожидания реального шага громкости от LVA
 )
 
 // mpdLink — переподключающийся клиент MPD. conn и watcher живут в своей
@@ -155,6 +156,14 @@ func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
 	}
 }
 
+// Названия эффектов кольца, видимые в HA (регистрация в RegisterLight и
+// ветвление в light_command должны совпадать).
+const (
+	HA_EFFECT_COLOR = "Цвет"      // просто цвет (solid)
+	HA_EFFECT_PULSE = "Пульсация" // дыхание цветом из HA
+	HA_EFFECT_SPIN  = "Вращение"  // бегущий диод цветом из HA
+)
+
 func main() {
 	mpdAddr := flag.String("mpd", "127.0.0.1:6600", "адрес MPD")
 	lvaAddr := flag.String("lva", ":6055", "слушать LVA peripheral API на этом адресе; пусто = выключено")
@@ -219,7 +228,7 @@ func main() {
 	if *lvaAddr != "" {
 		onConnect := func(c *lva.Client) {
 			if *lvaLight {
-				c.RegisterLight("Кольцо", "ring", []string{"Voice Assistant"})
+				c.RegisterLight("Кольцо", "ring", []string{HA_EFFECT_COLOR, HA_EFFECT_PULSE, HA_EFFECT_SPIN})
 			}
 		}
 		srv := lva.New(*lvaAddr, onConnect)
@@ -315,16 +324,32 @@ func main() {
 			}(conn)
 		}
 	}(*volapiAddr)
+	// Обратная связь кнопок громкости при живом LVA — по РЕАЛЬНОМУ sink.
+	// Регулировка как была: volume_up/down уходит в LVA, шаг знает только
+	// он. volume_changed после применения пишет в volchangeCh реальную
+	// громкость sink; volStep ждёт её с таймером VOL_STEP_WAIT — зависнуть
+	// навсегда нельзя. Пока volStep не ждёт (голосовая команда), volume_changed
+	// не сумел записать в канал и даёт отклик сам — двойного отклика нет.
+	volchangeCh := make(chan int)
 	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
 	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
-	// (5% по умолчанию, --peripheral-volume-step), результат прилетит
-	// volume_changed'ом. Автономно: локальный pactl, шаг наш собственный.
+	// (5% по умолчанию, --peripheral-volume-step). Автономно: локальный
+	// pactl, шаг наш собственный.
 	volStep := func(up bool) {
 		if lvaClient.Connected() {
 			if up {
 				lvaClient.Send("volume_up", nil)
 			} else {
 				lvaClient.Send("volume_down", nil)
+			}
+			select {
+			case p := <-volchangeCh:
+				if p > VOLUME_MAX_PCT {
+					p = VOLUME_MAX_PCT
+				}
+				volFeedback(toVisual(p))
+			case <-time.After(VOL_STEP_WAIT):
+				// громкость за окно не изменилась — без отклика
 			}
 			return
 		}
@@ -425,6 +450,9 @@ func main() {
 			switch e.Event {
 			case lva.EvDown:
 				rg.SetLive(false)
+				// LVA отвалил — duck снять: иначе музыка останется
+				// приглушённой до следующего диалога
+				setDucked(false)
 			case "snapshot":
 				rg.SetSnapshot(e.Bool("muted"))
 				if e.Has("volume") {
@@ -435,6 +463,18 @@ func main() {
 					// физическая шкала на сетке инкремента клавиш
 					setSinkPct(fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX))))
 				}
+				if e.Has("ducked") {
+					// duck_changed — state-событие, LVA реплеит его в
+					// snapshot: после реконнекта демон сразу знает
+					// актуальное состояние duck (satellite.py duck()/unduck())
+					setDucked(e.Bool("ducked"))
+				}
+
+			case "duck_changed":
+				// LVA приглушил/вернул музыку плеера на время диалога:
+				// master ×DUCK_PCT%, TTS (роль tts) не трогается
+				setDucked(e.Bool("ducked"))
+
 			case "zeroconf":
 				// upstream: status "getting_started" | "connected"
 				// (peripheral_api.md:127) — connected снимает noconn
@@ -476,6 +516,17 @@ func main() {
 				// клавиш (кламп внутри), в отклик — визуальные 0..100
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
+				// Кнопки ждут РЕАЛЬНУЮ громкость sink в volchangeCh —
+				// туда она попадает, только если volStep сейчас ждёт
+				// (небуферизованный канал). Не дождался получателя —
+				// это голосовая команда, отклик здесь же.
+				if real := getSinkPct(); real >= 0 {
+					select {
+					case volchangeCh <- real:
+						continue
+					default:
+					}
+				}
 				volFeedback(toVisual(pct))
 
 			case "light_command":
@@ -483,25 +534,31 @@ func main() {
 				if lc.ObjectID != "ring" {
 					continue
 				}
-				// Эффект в ветке НЕ смотрим: HA держит выбранный эффект
-				// («Voice Assistant») и шлёт его В КАЖДОЙ команде, в т.ч.
-				// при смене цвета (проверено payload-щупом 2026-11-11),
-				// а варианта «без эффекта» в UI при одном объявленном
-				// эффекте нет — по effect ветка всегда уходила в
-				// «вернуть демону». Семантика по state:
-				//   вкл  → кольцо = цвет из HA (rgb×brightness);
+				// HA держит выбранный эффект и шлёт его В КАЖДОЙ команде,
+				// в т.ч. при смене цвета (проверено payload-щупом
+				// 2026-11-11). Ветвимся по эффекту + state:
+				//   вкл + Цвет      → solid (rgb×brightness);
+				//   вкл + Пульсация → ha_pulse (дыхание цветом из HA);
+				//   вкл + Вращение  → ha_spin  (бегущий диод, фон 30%);
 				//   выкл → вернуть кольцо демону (диалоговые сцены).
 				if lc.State {
 					k := lc.Brightness
-					rg.SetSolid(ring.Color{
+					col := ring.Color{
 						R: uint8(lc.Red * 255 * k),
 						G: uint8(lc.Green * 255 * k),
 						B: uint8(lc.Blue * 255 * k),
-					})
-					rg.SetHA(true)
+					}
+					switch lc.Effect {
+					case HA_EFFECT_PULSE:
+						rg.SetHA(ring.HAPulse, col)
+					case HA_EFFECT_SPIN:
+						rg.SetHA(ring.HASpin, col)
+					default: // Цвет и всё незнакомое — просто цвет
+						rg.SetHA("", col)
+					}
 				} else {
 					// HA выключил сущность — кольцо снова живёт само
-					rg.SetHA(false)
+					rg.SetHAOff()
 				}
 			default:
 				log.Printf("lva: событие %s (без обработки)", e.Event)
@@ -517,6 +574,54 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-t.C:
 	}
+}
+
+// duck — событие duck_changed от LVA (фork r4650g): на время диалога
+// (wake/thinking/speaking) музыка плеера приглушается, по концу TTS
+// возвращается. Плеер колонки — mpd → sink master (mpd.conf), TTS играет
+// в соседнюю роль tts (lva.pa) и от master'а не зависит, поэтому гасим
+// сам master (= @DEFAULT_SINK@) в DUCK_PCT% от пользовательской громкости.
+// duck_changed реплеится в snapshot при реконнекте (state-событие).
+const DUCK_PCT = 50
+
+// duckState — состояние duck. userPct — пользовательская громкость master
+// (0..VOLUME_MAX_PCT, -1 = не узнали): при duck в sink уходит ×DUCK_PCT/100,
+// при unduck — полная. Мьютекс: пишут и главный цикл (LVA-события), и
+// volapi-горутина (DLNA-громкость) через setSinkPct.
+var duckState = struct {
+	sync.Mutex
+	ducked  bool
+	userPct int
+}{userPct: -1}
+
+// setDucked — вход/выход из duck. При входе текущая громкость (ещё полная)
+// запоминается как пользовательская, в sink уходит её DUCK_PCT%; при выходе
+// пользовательская возвращается целиком — даже если во время duck громкость
+// меняли (setSinkPct всё это время писал приглушённую и помнил полную).
+func setDucked(d bool) {
+	duckState.Lock()
+	if duckState.ducked == d {
+		duckState.Unlock()
+		return
+	}
+	duckState.ducked = d
+	user := duckState.userPct
+	duckState.Unlock()
+
+	if !d {
+		if user >= 0 {
+			writeSinkPct(user)
+		}
+		return
+	}
+	cur := getSinkPct() // ещё не задакано — это пользовательская громкость
+	if cur < 0 {
+		return // PA не ответил: duck останется чистым состоянием до setSinkPct
+	}
+	duckState.Lock()
+	duckState.userPct = cur
+	duckState.Unlock()
+	writeSinkPct(cur * DUCK_PCT / 100)
 }
 
 // pactl — управление системной громкостью PulseAudio. Сокет задаём явно,
@@ -558,8 +663,10 @@ func getSinkPct() int {
 	return -1
 }
 
-// setSinkPct — пара к getSinkPct: абсолютная физическая громкость sink
-// 0..VOLUME_MAX_PCT (не доля 0..1!), чужой вход режет сама.
+// setSinkPct — единственная точка установки ПОЛЬЗОВАТЕЛЬСКОЙ громкости
+// master (0..VOLUME_MAX_PCT, кламп внутри). Запоминает её как userPct, а в
+// sink пишет с duck-фактором: во время диалога музыка приглушена, но
+// пользовательская громкость не теряется и вернётся при unduck.
 func setSinkPct(p int) {
 	if p < 0 {
 		p = 0
@@ -567,6 +674,19 @@ func setSinkPct(p int) {
 	if p > VOLUME_MAX_PCT {
 		p = VOLUME_MAX_PCT
 	}
+	duckState.Lock()
+	duckState.userPct = p
+	if duckState.ducked {
+		p = p * DUCK_PCT / 100
+	}
+	duckState.Unlock()
+	writeSinkPct(p)
+}
+
+// writeSinkPct — голая запись физической громкости sink 0..VOLUME_MAX_PCT.
+// Вызывают только setSinkPct (пользовательская, с duck-фактором) и
+// setDucked (переходы duck).
+func writeSinkPct(p int) {
 	pactl("set-sink-volume", "@DEFAULT_SINK@", fmt.Sprintf("%d%%", p))
 }
 
