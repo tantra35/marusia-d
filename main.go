@@ -486,20 +486,25 @@ func main() {
 				if lc.ObjectID != "ring" {
 					continue
 				}
-				if lc.Effect == "Voice Assistant" {
-					// HA вернул управление демону
-					rg.SetHA(false)
-				} else {
+				// Эффект в ветке НЕ смотрим: HA держит выбранный эффект
+				// («Voice Assistant») и шлёт его В КАЖДОЙ команде, в т.ч.
+				// при смене цвета (проверено payload-щупом 2026-11-11),
+				// а варианта «без эффекта» в UI при одном объявленном
+				// эффекте нет — по effect ветка всегда уходила в
+				// «вернуть демону». Семантика по state:
+				//   вкл  → кольцо = цвет из HA (rgb×brightness);
+				//   выкл → вернуть кольцо демону (диалоговые сцены).
+				if lc.State {
 					k := lc.Brightness
 					rg.SetSolid(ring.Color{
 						R: uint8(lc.Red * 255 * k),
 						G: uint8(lc.Green * 255 * k),
 						B: uint8(lc.Blue * 255 * k),
 					})
-					if !lc.State {
-						rg.SetSolid(ring.Off)
-					}
 					rg.SetHA(true)
+				} else {
+					// HA выключил сущность — кольцо снова живёт само
+					rg.SetHA(false)
 				}
 			default:
 				log.Printf("lva: событие %s (без обработки)", e.Event)
