@@ -46,6 +46,13 @@ var (
 	noconnRGB    = [3]byte{0x64, 0x00, 0x00} // нет связи с LVA — тусклый красный
 )
 
+// Сцены HA-эффекта (значение haEffect). Имена-сцены внутренние; строковые
+// названия эффектов, видимые в HA, объявлены в main.go рядом с RegisterLight.
+const (
+	HAPulse = "pulse" // пульсация (дыхание) цветом из HA
+	HASpin  = "spin"  // вращение бегущего диода цветом из HA
+)
+
 // Color — RGB 0..255.
 type Color struct{ R, G, B uint8 }
 
@@ -57,6 +64,7 @@ const (
 	cmdSetLive
 	cmdSetSnapshot
 	cmdSetHA
+	cmdSetHAOff
 	cmdSetScale
 	cmdSetSolid
 	cmdFlash
@@ -83,9 +91,10 @@ type Ring struct {
 
 	dialog   string // "" | listening | thinking | speaking
 	muted    bool
-	lvaSeen  bool // было хоть одно живое соединение с LVA
-	lvaLive  bool // соединение открыто сейчас
-	haActive bool // кольцом управляет HA (light_command)
+	lvaSeen  bool   // было хоть одно живое соединение с LVA
+	lvaLive  bool   // соединение открыто сейчас
+	haActive bool   // кольцом управляет HA (light_command)
+	haEffect string // сцена HA-эффекта: "" (solid) | haPulse | haSpin
 
 	scale float64 // глобальная яркость от датчика света (0..1)
 	solid Color   // цвет для сцены solid (light_command из HA)
@@ -152,9 +161,17 @@ func (r *Ring) SetSnapshot(muted bool) {
 	r.send(&cmd)
 }
 
-// SetHA — кольцом управляет Home Assistant.
-func (r *Ring) SetHA(on bool) {
-	cmd := ringCmd{kind: cmdSetHA, b: on, reply: make(chan any, 1)}
+// SetHA — кольцо под управлением Home Assistant: включить HA-сцену.
+// scene "" = solid (просто цвет c), haPulse = пульсация цветом c,
+// haSpin = вращение бегущего диода цветом c (фон 30%).
+func (r *Ring) SetHA(scene string, c Color) {
+	cmd := ringCmd{kind: cmdSetHA, str: scene, c: c, reply: make(chan any, 1)}
+	r.send(&cmd)
+}
+
+// SetHAOff — HA выключил сущность: кольцо снова живёт само.
+func (r *Ring) SetHAOff() {
+	cmd := ringCmd{kind: cmdSetHAOff, reply: make(chan any, 1)}
 	r.send(&cmd)
 }
 
@@ -178,11 +195,17 @@ func (r *Ring) Flash(c Color, d time.Duration) {
 	r.send(&cmd)
 }
 
-// resolve — вычислить сцену из состояния: solid (HA) > noconn >
+// resolve — вычислить сцену из состояния: solid/эффект (HA) > noconn >
 // muted > диалог. Чистая функция — состояние не меняет.
 func (r *Ring) resolve() string {
 	switch {
 	case r.haActive:
+		switch r.haEffect {
+		case HAPulse:
+			return "ha_pulse"
+		case HASpin:
+			return "ha_spin"
+		}
 		return "solid"
 	case r.lvaSeen && !r.lvaLive:
 		return "noconn"
@@ -210,7 +233,12 @@ func (r *Ring) exec(cmd *ringCmd) any {
 	case cmdSetSnapshot:
 		r.lvaSeen, r.lvaLive, r.muted = true, true, cmd.b
 	case cmdSetHA:
-		r.haActive = cmd.b
+		r.haActive = true
+		r.haEffect = cmd.str
+		r.solid = cmd.c
+	case cmdSetHAOff:
+		r.haActive = false
+		r.haEffect = ""
 	case cmdSetScale:
 		if cmd.f < 0 {
 			cmd.f = 0
@@ -241,6 +269,23 @@ func mul(c [3]byte, k float64) [3]byte {
 func breathe(now time.Time, period time.Duration) float64 {
 	s := math.Sin(2 * math.Pi * float64(now.UnixNano()%int64(period)) / float64(period))
 	return 0.15 + 0.85*(s+1)/2
+}
+
+// spin — бегущий диод: фон цветом c на яркости k + один диод на полной
+// яркости c, позиция бежит по кругу за spinPeriod.
+func spin(now time.Time, c [3]byte, k, scale float64) [12][3]byte {
+	var px [12][3]byte
+	bg := mul(c, k*scale)
+	ms := now.UnixMilli() % int64(spinPeriod/time.Millisecond)
+	pos := int(ms) * leds / int(spinPeriod/time.Millisecond)
+	for i := range px {
+		if i == pos {
+			px[i] = mul(c, scale)
+		} else {
+			px[i] = bg
+		}
+	}
+	return px
 }
 
 // frame — кадр для текущего состояния и момента времени.
@@ -295,19 +340,21 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 			px[i] = mul(c, b)
 		}
 		return "", px, true
-	case "thinking":
-		// фон кольца в пол-яркости + один диод на 100%, бегущий по кругу
-		bg := mul(THINK_RGB, 0.5*r.scale)
-		ms := now.UnixMilli() % int64(spinPeriod/time.Millisecond)
-		pos := int(ms) * leds / int(spinPeriod/time.Millisecond)
+	case "ha_pulse":
+		// дыхание (как listening) цветом из HA
+		b := breathe(now, breathePeriod) * r.scale
+		c := [3]byte{r.solid.R, r.solid.G, r.solid.B}
 		for i := range px {
-			if i == pos {
-				px[i] = mul(THINK_RGB, r.scale)
-			} else {
-				px[i] = bg
-			}
+			px[i] = mul(c, b)
 		}
 		return "", px, true
+	case "ha_spin":
+		// бегущий диод цветом из HA; фон 30% (по просьбе: 50% слишком ярко)
+		c := [3]byte{r.solid.R, r.solid.G, r.solid.B}
+		return "", spin(now, c, 0.3, r.scale), true
+	case "thinking":
+		// фон кольца в пол-яркости + один диод на 100%, бегущий по кругу
+		return "", spin(now, THINK_RGB, 0.5, r.scale), true
 	default: // off — чёрный
 		return "off", px, false
 	}

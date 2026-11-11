@@ -147,6 +147,52 @@ func TestFrameThinkingSpinner(t *testing.T) {
 	}
 }
 
+// TestFrameHAEffects — эффекты из HA: пульс = дыхание цветом solid,
+// вращение = бегущий диод с фоном в 30% (не 50%).
+func TestFrameHAEffects(t *testing.T) {
+	r := New("/dev/null", 12)
+	r.haActive = true
+	r.haEffect = HAPulse
+	r.solid = Color{255, 0, 0}
+	r.scale = 1
+
+	now := time.Now()
+	key, px, animated := r.frame(now)
+	if key != "" || !animated {
+		t.Fatalf("ha_pulse: key = %q animated = %v, want анимацию дыхания", key, animated)
+	}
+	if px[0] != mul([3]byte{255, 0, 0}, breathe(now, breathePeriod)) {
+		t.Fatalf("ha_pulse: px[0] = %v, want цвет из HA", px[0])
+	}
+
+	r.haEffect = HASpin
+	_, px, animated = r.frame(now)
+	if key != "" || !animated {
+		t.Fatalf("ha_spin: key = %q animated = %v, want анимацию вращения", key, animated)
+	}
+	full, runner := 0, -1
+	for i, p := range px {
+		if p == mul([3]byte{255, 0, 0}, 1) {
+			full, runner = full+1, i
+		}
+	}
+	if full != 1 {
+		t.Fatalf("ha_spin: диодов 100%% яркости = %d, want ровно один", full)
+	}
+	for i, p := range px {
+		if i != runner && p != mul([3]byte{255, 0, 0}, 0.3) {
+			t.Fatalf("ha_spin: px[%d] = %v, want фон в 30%% яркости", i, p)
+		}
+	}
+
+	// SetHAOff через актора возвращает сцену демону
+	r.haEffect = ""
+	r.haActive = false
+	if scene := r.resolve(); scene != "off" {
+		t.Fatalf("после HA-выкл сцена = %q, want off", scene)
+	}
+}
+
 func TestFrameOff(t *testing.T) {
 	r := New("/dev/null", 12)
 	r.scale = 1
