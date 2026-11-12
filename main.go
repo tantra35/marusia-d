@@ -162,6 +162,7 @@ const (
 	HA_EFFECT_COLOR = "Цвет"      // просто цвет (solid)
 	HA_EFFECT_PULSE = "Пульсация" // дыхание цветом из HA
 	HA_EFFECT_SPIN  = "Вращение"  // бегущий диод цветом из HA
+	HA_EFFECT_FIRE  = "Огонь"     // мерцание цветом из HA
 )
 
 func main() {
@@ -228,7 +229,7 @@ func main() {
 	if *lvaAddr != "" {
 		onConnect := func(c *lva.Client) {
 			if *lvaLight {
-				c.RegisterLight("Кольцо", "ring", []string{HA_EFFECT_COLOR, HA_EFFECT_PULSE, HA_EFFECT_SPIN})
+				c.RegisterLight("Кольцо", "ring", []string{HA_EFFECT_COLOR, HA_EFFECT_PULSE, HA_EFFECT_SPIN, HA_EFFECT_FIRE})
 			}
 		}
 		srv := lva.New(*lvaAddr, onConnect)
@@ -529,6 +530,7 @@ func main() {
 				//   вкл + Цвет      → solid (rgb×brightness);
 				//   вкл + Пульсация → ha_pulse (дыхание цветом из HA);
 				//   вкл + Вращение  → ha_spin  (бегущий диод, фон 30%);
+				//   вкл + Огонь     → ha_fire  (независимое мерцание);
 				//   выкл → вернуть кольцо демону (диалоговые сцены).
 				if lc.State {
 					k := lc.Brightness
@@ -542,6 +544,8 @@ func main() {
 						rg.SetHA(ring.HAPulse, col)
 					case HA_EFFECT_SPIN:
 						rg.SetHA(ring.HASpin, col)
+					case HA_EFFECT_FIRE:
+						rg.SetHA(ring.HAFire, col)
 					default: // Цвет и всё незнакомое — просто цвет
 						rg.SetHA("", col)
 					}

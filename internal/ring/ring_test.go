@@ -193,6 +193,53 @@ func TestFrameHAEffects(t *testing.T) {
 	}
 }
 
+// TestFrameHAFire — «огонь»: анимация, диоды мерцают независимо
+// (яркость каждого в диапазоне 0.10..1 и меняется со временем).
+func TestFrameHAFire(t *testing.T) {
+	r := New("/dev/null", 12)
+	r.haActive = true
+	r.haEffect = HAFire
+	r.solid = Color{255, 0, 0}
+	r.scale = 1
+
+	now := time.Now()
+	key, px, animated := r.frame(now)
+	if key != "" || !animated {
+		t.Fatalf("ha_fire: key = %q animated = %v, want анимацию мерцания", key, animated)
+	}
+	// каждый диод — цвет из HA, умноженный на коэффициент 0.10..1 (допуск
+	// на округление байта); фиолетовых/чужих оттенков быть не должно
+	for i, p := range px {
+		k := float64(p[0]) / 255
+		if p[1] != 0 || p[2] != 0 || k < 0.09 || k > 1.0 {
+			t.Fatalf("ha_fire: px[%d] = %v (коэфф %.3f), want %v × [0.10..1]", i, p, k, r.solid)
+		}
+	}
+	// диоды мерцают НЕзависимо: все двенадцать на одной яркости — не огонь
+	uniform := true
+	for i := 1; i < leds; i++ {
+		if px[i] != px[0] {
+			uniform = false
+			break
+		}
+	}
+	if uniform {
+		t.Fatal("ha_fire: все диоды одной яркости — мерцание не независимо")
+	}
+	// картинка меняется со временем
+	_, px2, _ := r.frame(now.Add(200 * time.Millisecond))
+	changed := false
+	for i := range px {
+		if px[i] != px2[i] {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		t.Fatal("ha_fire: кадр не меняется со временем")
+	}
+}
+
 func TestFrameOff(t *testing.T) {
 	r := New("/dev/null", 12)
 	r.scale = 1

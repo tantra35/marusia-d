@@ -32,11 +32,15 @@ const (
 	FLASH_MS          = 800 * time.Millisecond  // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
 
-	// HA-эффекты (Цвет/Пульсация/Вращение): период 1.5 с, у пульса
+	// HA-эффекты (Цвет/Пульсация/Вращение/Огонь): период 1.5 с, у пульса
 	// минимум почти до нуля (LVA-сцены дышат 800 мс с полом 0.15)
 	haPulsePeriod = 1500 * time.Millisecond
 	haSpinPeriod  = 1500 * time.Millisecond
 	haPulseMin    = 0.05
+
+	// «Огонь»: медленная волна + быстрая дрожь (мс), яркость 0.10..1
+	fireSlowMS = 1700
+	fireFastMS = 430
 )
 
 // Палитра сцен (RGB). var, не const: литералы массивов в Go константами не бывают.
@@ -57,6 +61,7 @@ var (
 const (
 	HAPulse = "pulse" // пульсация (дыхание) цветом из HA
 	HASpin  = "spin"  // вращение бегущего диода цветом из HA
+	HAFire  = "fire"  // «огонь» — мерцание цветом из HA
 )
 
 // Color — RGB 0..255.
@@ -211,6 +216,8 @@ func (r *Ring) resolve() string {
 			return "ha_pulse"
 		case HASpin:
 			return "ha_spin"
+		case HAFire:
+			return "ha_fire"
 		}
 		return "solid"
 	case r.lvaSeen && !r.lvaLive:
@@ -299,6 +306,20 @@ func spin(now time.Time, c [3]byte, k, scale float64, period time.Duration) [12]
 	return px
 }
 
+// fire — «огонь»: диоды мерцают НЕЗАВИСИМО, каждый — сумма медленной
+// волны и быстрой дрожи с фазой, сдвинутой по кругу (детерминированно
+// от времени — годится для тестов). Диапазон яркости 0.10..1.
+func fire(now time.Time, c [3]byte, scale float64) [12][3]byte {
+	var px [12][3]byte
+	ms := float64(now.UnixMilli())
+	for i := range px {
+		slow := math.Sin(2*math.Pi*ms/float64(fireSlowMS) + float64(i)*2.4)
+		fast := math.Sin(2*math.Pi*ms/float64(fireFastMS) + float64(i)*5.1)
+		px[i] = mul(c, (0.55 + 0.33*slow + 0.12*fast) * scale)
+	}
+	return px
+}
+
 // frame — кадр для текущего состояния и момента времени.
 // key — ключ статичного кадра ("" у анимаций), px — пиксели.
 // Чистая: только читает состояние — годится для тестов.
@@ -364,6 +385,10 @@ func (r *Ring) frame(now time.Time) (key string, px [12][3]byte, animated bool) 
 		// 50% слишком ярко)
 		c := [3]byte{r.solid.R, r.solid.G, r.solid.B}
 		return "", spin(now, c, 0.3, r.scale, haSpinPeriod), true
+	case "ha_fire":
+		// «огонь»: диоды мерцают независимо, цвет из HA
+		c := [3]byte{r.solid.R, r.solid.G, r.solid.B}
+		return "", fire(now, c, r.scale), true
 	case "thinking":
 		// фон кольца в пол-яркости + один диод на 100%, бегущий по кругу
 		return "", spin(now, THINK_RGB, 0.5, r.scale, spinPeriod), true
