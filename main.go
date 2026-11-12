@@ -432,7 +432,7 @@ func main() {
 	// LVA ничего не отвечает на репорт, поэтому отклик (звук+вспышка+панель)
 	// рисуем сразу, без ожидания.
 	volStep := func(up bool) {
-		pct := getSinkPct()
+		pct := getUserPct() // во время duck — пользовательская, не приглушённый sink
 		if pct < 0 {
 			return
 		}
@@ -777,6 +777,19 @@ func setSinkPct(p int) {
 	}
 	duckState.Unlock()
 	writeSinkPct(p)
+}
+
+// getUserPct — громкость, от которой шагают кнопки: во время duck sink
+// держит приглушённое значение (×DUCK_PCT), а шагать и запоминать надо
+// полную пользовательскую (duckState.userPct), иначе база шага — половина,
+// и каждое нажатие занижает сохранённую громкость вдвое. -1 = не узнали.
+func getUserPct() int {
+	duckState.Lock()
+	defer duckState.Unlock()
+	if duckState.ducked {
+		return duckState.userPct
+	}
+	return getSinkPct()
 }
 
 // writeSinkPct — голая запись физической громкости sink 0..VOLUME_MAX_PCT.
