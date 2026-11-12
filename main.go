@@ -594,17 +594,6 @@ func main() {
 				// спад дорисовывается в рендере); «голос» ошибки играет LVA
 				rg.Flash(ring.ERROR_COLOR, ERROR_FLASH_MS)
 
-			case "volume_changed":
-				// LVA-сторона изменила громкость (HA слайдер, set_volume):
-				// {"volume": float} 0.0..1.0 — доля ВИЗУАЛЬНОЙ шкалы, ×100 —
-				// 0..100 (шкала toVisual); fromVisual — физическая на сетке
-				// инкремента клавиш (кламп внутри), в отклик — визуальные 0..100.
-				// Собственный репорт демона LVA не возвращает (разрыв петли),
-				// так что петли здесь нет.
-				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
-				setSinkPct(pct)
-				volFeedback(toVisual(pct))
-
 			case "media_player_set_volume":
 				// HA слайдер/мьют внешнему плееру: та же шкала, что у
 				// volume_changed; применили sink — отрепортим правду

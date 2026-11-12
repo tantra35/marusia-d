@@ -44,8 +44,7 @@ LVA подключается к ней сам. Колонка не знает а
 | `muted true` | muted — тускло-красный статичный (звук мьюта играет LVA) |
 | `pipeline_error` | красная вспышка 1.6 с (overlay поверх любых сцен; звук ошибки играет LVA) |
 | обрыв связи | noconn — тёмно-красное дыхание (после первого удачного коннекта) |
-| `volume_changed` | от LVA (`{"volume": 0.0–1.0}`, только LVA-сторона: HA-слайдер, `set_volume`) → громкость системного sink + вспышка цветом уровня и звук; репорт демона LVA не возвращает (разрыв петли) |
-| `media_player_set_volume` | HA-громкость внешнему плееру → sink + отклик + репорт `volume_changed` |
+| `media_player_set_volume` | HA-громкость внешнему плееру → sink + отклик + репорт `volume_changed`; событие `volume_changed` демону при внешнем плеере не приходит (свои репорты LVA не возвращает, HA-слайдер идёт инструкцией) — кейса нет |
 | `media_player_play` | HA-медиа: `media_url` (строка или список) → очередь mpd заменяется, играем |
 | `media_player_pause` / `media_player_resume` / `media_player_stop` | транспорт HA → mpd (`Pause(true/false)` / `Stop`) |
 | `media_player_playing` / `media_player_paused` | эхо собственных репортов — игнорируется |
