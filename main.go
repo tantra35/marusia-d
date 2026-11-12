@@ -4,8 +4,10 @@
 //
 // Источники событий → state machine → рендер:
 //
-//	mpd watcher (player)      → play/pause кнопкой, лица на панели; кольцо от mpd не светится
-//	LVA peripheral API (ws)   → диалог: wake/listening/thinking/speaking/muted/error/noconn
+//	mpd watcher (player)      → play/pause кнопкой, лица на панели, репорт
+//	                           media_player_state в LVA; кольцо от mpd не светится
+//	LVA peripheral API (ws)   → диалог: wake/listening/thinking/speaking/muted/error/noconn;
+//	                           внешний медиа-плеер: media_player_* → mpd
 //	touch /dev/input/event0   → громкость ±10, play/pause, start_listening, mute
 //	light bh1730 (2с)         → глобальная яркость кольца
 //	clock                     → время ЧЧ:ММ, лица на события
@@ -64,16 +66,18 @@ const (
 	VOLUME_MAX_PCT    = 150                     // физическая громкость sink, больше нельзя
 	VOLUME_STEP_PCT   = 10                      // инкремент клавиш громкости — сетка громкости кратна ему
 	VOLUME_VISUAL_MAX = 100                     // визуальная шкала (кольцо, панель): 0..100
-	VOL_STEP_WAIT     = 1500 * time.Millisecond // окно ожидания реального шага громкости от LVA
 )
 
 // mpdLink — переподключающийся клиент MPD. conn и watcher живут в своей
-// горутине; наружу — Serve, togglePause и statesCh.
+// горутине; наружу — Serve, команды воспроизведения (togglePause/playURLs/
+// pause/resume/stop) и statesCh. lastState — последнее известное состояние
+// плеера (для репорта новому LVA-коннекту); писатель один — Serve.
 type mpdLink struct {
-	addr     string
-	mu       sync.Mutex
-	conn     *mpd.Client
-	statesCh chan string
+	addr      string
+	mu        sync.Mutex
+	conn      *mpd.Client
+	lastState string
+	statesCh  chan string
 }
 
 // Serve — цикл переподключения к mpd: коннект → статус/watch → при обрыве
@@ -96,14 +100,14 @@ func (m *mpdLink) Serve(ctx context.Context) {
 		m.mu.Unlock()
 		log.Printf("mpd: подключено к %s", m.addr)
 		if st, err := c.Status(); err == nil {
-			m.statesCh <- st["state"]
+			m.setState(st["state"])
 		}
 		m.watch(ctx, c)
 		m.mu.Lock()
 		m.conn = nil
 		m.mu.Unlock()
 		c.Close()
-		m.statesCh <- "stop" // нет связи с mpd — кольцо гасим
+		m.setState("stop") // нет связи с mpd — кольцо гасим
 		log.Printf("mpd: связь потеряна (повтор через 5с)")
 		sleepCtx(ctx, 5*time.Second)
 	}
@@ -123,6 +127,77 @@ func (m *mpdLink) togglePause() {
 		return
 	}
 	c.Pause(st["state"] == "play")
+}
+
+// setState — положить состояние плеера в канал и запомнить его. Писатель
+// один — Serve/watch; читатели — main-цикл (репорт media_player_state) и
+// onConnect (начальный репорт при новом LVA-коннекте).
+func (m *mpdLink) setState(s string) {
+	m.mu.Lock()
+	m.lastState = s
+	m.mu.Unlock()
+	m.statesCh <- s
+}
+
+// state — последнее известное состояние плеера mpd.
+func (m *mpdLink) state() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastState
+}
+
+// playURLs — HA запустил медиа: очередь заменяется URL(ами) из команды
+// (media_url приходит строкой или списком), играем последний добавленный.
+func (m *mpdLink) playURLs(urls []string) {
+	m.mu.Lock()
+	c := m.conn
+	m.mu.Unlock()
+	if c == nil || len(urls) == 0 {
+		return
+	}
+	c.Clear()
+	last := -1
+	for _, u := range urls {
+		if id, err := c.AddID(u, -1); err == nil {
+			last = id
+		}
+	}
+	if last >= 0 {
+		c.PlayID(last)
+	}
+}
+
+// pause — пауза воспроизведения (инструкция media_player_pause).
+func (m *mpdLink) pause() {
+	m.mu.Lock()
+	c := m.conn
+	m.mu.Unlock()
+	if c == nil {
+		return
+	}
+	c.Pause(true)
+}
+
+// resume — продолжить воспроизведение (инструкция media_player_resume).
+func (m *mpdLink) resume() {
+	m.mu.Lock()
+	c := m.conn
+	m.mu.Unlock()
+	if c == nil {
+		return
+	}
+	c.Pause(false)
+}
+
+// stop — остановить воспроизведение (инструкция media_player_stop).
+func (m *mpdLink) stop() {
+	m.mu.Lock()
+	c := m.conn
+	m.mu.Unlock()
+	if c == nil {
+		return
+	}
+	c.Stop()
 }
 
 func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
@@ -145,7 +220,7 @@ func (m *mpdLink) watch(ctx context.Context, c *mpd.Client) {
 			switch ev {
 			case "player":
 				if st, err := c.Status(); err == nil {
-					m.statesCh <- st["state"]
+					m.setState(st["state"])
 				}
 			}
 		case <-ping.C:
@@ -230,6 +305,18 @@ func main() {
 		onConnect := func(c *lva.Client) {
 			if *lvaLight {
 				c.RegisterLight("Кольцо", "ring", []string{HA_EFFECT_COLOR, HA_EFFECT_PULSE, HA_EFFECT_SPIN, HA_EFFECT_FIRE})
+			}
+			// Колонка — внешний медиа-плеер: HA управляет воспроизведением
+			// через демон (инструкции media_player_*), демон репортит правду
+			// (media_player_state / volume_changed). Регистрация умирает
+			// вместе с коннектом — при каждом коннекте повторяем.
+			c.Send("register_media_player", nil)
+			// Начальный репорт: новый LVA не знает состояние нашего mpd
+			switch mpdLink.state() {
+			case "play":
+				c.Send("media_player_state", map[string]string{"state": "playing"})
+			case "pause":
+				c.Send("media_player_state", map[string]string{"state": "paused"})
 			}
 		}
 		srv := lva.New(*lvaAddr, onConnect)
@@ -325,33 +412,20 @@ func main() {
 			}(conn)
 		}
 	}(*volapiAddr)
-	// Обратная связь кнопок громкости при живом LVA — по РЕАЛЬНОМУ изменению.
-	// Регулировка как была: volume_up/down уходит в LVA, шаг знает только
-	// он, отклик (звук+вспышка+панель) даёт volume_changed — как и раньше.
-	// volStep лишь ждёт подтверждения через volchangeCh с таймером
-	// VOL_STEP_WAIT, чтобы не вернуться раньше, чем громкость применилась.
-	volchangeCh := make(chan struct{})
-	// up=true → KEY_VOLUP, up=false → KEY_VOLDOWN.
-	// LVA подключен: команды volume_up/volume_down — шаг знает только LVA
-	// (5% по умолчанию, --peripheral-volume-step). Автономно: локальный
-	// pactl, шаг наш собственный.
+	// reportVolume — репорт реальной громкости в LVA (команда volume_changed,
+	// доля ВИЗУАЛЬНОЙ шкалы 0..1): LVA синкает HA-сущность, репорт обратно НЕ
+	// переизлучается (разрыв петли). pct — физическая громкость sink.
+	reportVolume := func(pct int) {
+		lvaClient.Send("volume_changed", map[string]any{
+			"volume": float64(toVisual(pct)) / VOLUME_VISUAL_MAX,
+		})
+	}
+	// Громкость клавиш — всегда локальный шаг: демон владеет физической
+	// громкостью sink (get → snap → ±10 → кламп → set). Команд volume_up/down
+	// в протоколе больше нет — LVA лишь принимает репорт volume_changed.
+	// LVA ничего не отвечает на репорт, поэтому отклик (звук+вспышка+панель)
+	// рисуем сразу, без ожидания.
 	volStep := func(up bool) {
-		if lvaClient.Connected() {
-			if up {
-				lvaClient.Send("volume_up", nil)
-			} else {
-				lvaClient.Send("volume_down", nil)
-			}
-			select {
-			case <-volchangeCh: // volume_changed приехал — громкость применилась
-			case <-time.After(VOL_STEP_WAIT):
-			}
-			return
-		}
-		// локальная ветка: шаг ±VOLUME_STEP_PCT считает сам демон — один get +
-		// один set (setSinkPct сам режет в 0..VOLUME_MAX_PCT). get вернул -1 =
-		// PA не ответил: и set упадёт так же (тот же pactl, тот же сокет),
-		// не шагаем.
 		pct := getSinkPct()
 		if pct < 0 {
 			return
@@ -369,6 +443,7 @@ func main() {
 		}
 		setSinkPct(pct)
 		volFeedback(toVisual(pct))
+		reportVolume(pct)
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
 	// Производитель — touch-горутина; потребитель — ровно один (ниже):
@@ -420,6 +495,7 @@ func main() {
 	}()
 
 	// ---------- главный цикл ----------
+	lastReported := "" // последнее состояние плеера, отрепорченное в LVA
 	for {
 		select {
 		case <-ctx.Done():
@@ -437,6 +513,13 @@ func main() {
 				}
 			}
 			log.Printf("mpd: %s", state)
+			// Репорт внешнему плееру: HA-сущность должна знать правду о
+			// воспроизведении (mpdLink.Serve шлёт и при потере связи —
+			// «stop» = idle). Дедуп по последнему отрепорченному.
+			if s := map[string]string{"play": "playing", "pause": "paused", "stop": "idle"}[state]; s != "" && s != lastReported {
+				lastReported = s
+				lvaClient.Send("media_player_state", map[string]string{"state": s})
+			}
 		case e, ok := <-lvaEventsCh:
 			if !ok {
 				lvaEventsCh = nil // поток закрыт
@@ -505,19 +588,42 @@ func main() {
 				rg.Flash(ring.ERROR_COLOR, ERROR_FLASH_MS)
 
 			case "volume_changed":
-				// upstream: {"volume": float} 0.0..1.0 — доля от максимума
-				// колонки (150%), ×100 — визуальные 0..100 (шкала
-				// toVisual); fromVisual — физическая на сетке инкремента
-				// клавиш (кламп внутри), в отклик — визуальные 0..100
+				// LVA-сторона изменила громкость (HA слайдер, set_volume):
+				// {"volume": float} 0.0..1.0 — доля ВИЗУАЛЬНОЙ шкалы, ×100 —
+				// 0..100 (шкала toVisual); fromVisual — физическая на сетке
+				// инкремента клавиш (кламп внутри), в отклик — визуальные 0..100.
+				// Собственный репорт демона LVA не возвращает (разрыв петли),
+				// так что петли здесь нет.
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
 				volFeedback(toVisual(pct))
-				// ждущий volStep разбудить; никого не ждёт (голосовая
-				// команда) — сигнал просто пропадает
-				select {
-				case volchangeCh <- struct{}{}:
-				default:
-				}
+
+			case "media_player_set_volume":
+				// HA слайдер/мьют внешнему плееру: та же шкала, что у
+				// volume_changed; применили sink — отрепортим правду
+				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
+				setSinkPct(pct)
+				volFeedback(toVisual(pct))
+				reportVolume(pct)
+
+			case "media_player_play":
+				// HA запустил медиа: очередь mpd заменяется URL из команды
+				// (media_url — строка или список); анонсы играются как обычное
+				// media, отдельной хореографии поверх трека нет
+				mpdLink.playURLs(e.StrOrList("media_url"))
+
+			case "media_player_pause":
+				mpdLink.pause()
+
+			case "media_player_resume":
+				mpdLink.resume()
+
+			case "media_player_stop":
+				mpdLink.stop()
+
+			case "media_player_playing", "media_player_paused":
+				// эхо наших же репортов: emit_event шлёт событие всем клиентам,
+				// плееру тоже; истину о состоянии демон знает от mpd напрямую
 
 			case "light_command":
 				lc := e.LightCommand()

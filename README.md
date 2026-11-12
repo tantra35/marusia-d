@@ -44,13 +44,27 @@ LVA подключается к ней сам. Колонка не знает а
 | `muted true` | muted — тускло-красный статичный (звук мьюта играет LVA) |
 | `pipeline_error` | красная вспышка 1.6 с (overlay поверх любых сцен; звук ошибки играет LVA) |
 | обрыв связи | noconn — тёмно-красное дыхание (после первого удачного коннекта) |
-| `volume_changed` | `{"volume": 0.0–1.0}` (upstream) → громкость системного sink (sink = volume×150%) + вспышка цветом уровня и звук |
+| `volume_changed` | от LVA (`{"volume": 0.0–1.0}`, только LVA-сторона: HA-слайдер, `set_volume`) → громкость системного sink + вспышка цветом уровня и звук; репорт демона LVA не возвращает (разрыв петли) |
+| `media_player_set_volume` | HA-громкость внешнему плееру → sink + отклик + репорт `volume_changed` |
+| `media_player_play` | HA-медиа: `media_url` (строка или список) → очередь mpd заменяется, играем |
+| `media_player_pause` / `media_player_resume` / `media_player_stop` | транспорт HA → mpd (`Pause(true/false)` / `Stop`) |
+| `media_player_playing` / `media_player_paused` | эхо собственных репортов — игнорируется |
 
 Приоритет сцен: `solid (HA) > noconn > muted > диалог`; вспышки (громкость/wake/ошибка) — overlay поверх всего.
 
-Обратно (сенсорные кнопки): 114/115 → при подключённом LVA — upstream-команды
-`volume_up`/`volume_down` (LVA меняет громкость, шлёт `volume_changed`, sink
-подтягивается; значение живёт в LVA/HA), автономно — локально `pactl` на sink.
+Обратно (сенсорные кнопки): 114/115 — локальный шаг ±10% по sink (`pactl`), реальная
+громкость уходит в LVA репортом `volume_changed` (доля визуальной шкалы 0..1; LVA
+синкает HA-сущность и репорт обратно не переизлучается), отклик (звук + вспышка
+кольца + панель) — сразу, без ожидания. Автономно — то же самое без репорта.
+
+Колонка — **внешний медиа-плеер** LVA: при коннекте демон шлёт
+`register_media_player`, HA-команды воспроизведения приходят инструкциями
+`media_player_play/pause/resume/stop/set_volume` (обрабатываются mpdLink'ом в
+главном цикле). Состояние mpd репортится в LVA (`media_player_state`:
+play/pause/stop → playing/paused/idle, дедуп по последнему отрепорченному) и при
+каждом новом коннекте — HA-сущность показывает правду. Регистрация умирает вместе
+с коннектом; анонсы (`announcement: true`) играются как обычное media.
+
 Громкость DLNA (слайдер контроллера) — через хуки upmpdcli
 (`externalvolumecontrol` → `/usr/local/bin/upmpdcli-volhook` → TCP-порт 6056
 демона, флаг `-volapi`): master = системный sink PA, mpd-поток громкость не

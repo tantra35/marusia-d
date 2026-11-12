@@ -87,3 +87,22 @@ func TestServe(t *testing.T) {
 		t.Fatalf("wake: got %s", e.Event)
 	}
 }
+
+// StrOrList — media_url приходит строкой или списком строк
+func TestStrOrList(t *testing.T) {
+	ev := func(data string) Event {
+		return Event{Data: json.RawMessage(data)}
+	}
+	if got := ev(`{"media_url":"http://radio"}`).StrOrList("media_url"); len(got) != 1 || got[0] != "http://radio" {
+		t.Fatalf("строка: %q", got)
+	}
+	if got := ev(`{"media_url":["a","b"]}`).StrOrList("media_url"); len(got) != 2 || got[1] != "b" {
+		t.Fatalf("список: %q", got)
+	}
+	if got := ev(`{}`).StrOrList("media_url"); got != nil {
+		t.Fatalf("нет поля: %q", got)
+	}
+	if got := ev(`{"media_url":5}`).StrOrList("media_url"); got != nil {
+		t.Fatalf("чужой тип: %q", got)
+	}
+}

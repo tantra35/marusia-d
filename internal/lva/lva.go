@@ -2,8 +2,10 @@
 // Assistant (docs/peripheral_api.md). Роли перевёрнуты относительно upstream:
 // marusia-d слушает (по умолчанию :6055), LVA подключается сам — колонка не
 // знает адреса LVA и молча работает изолированно, пока мозг не поднялся.
-// Слушает события диалога (wake/listening/thinking/speaking/idle...) и шлёт
-// команды (start_listening, mute_mic...).
+// Пакет слушает события диалога (wake/listening/thinking/speaking/idle...),
+// инструкции внешнего медиа-плеера (media_player_play/pause/resume/stop/
+// set_volume) и шлёт команды (start_listening, mute_mic, register_media_player,
+// репорты volume_changed / media_player_state...).
 package lva
 
 import (
@@ -203,6 +205,29 @@ func (e Event) Str(key string) string {
 	var d map[string]string
 	json.Unmarshal(e.Data, &d)
 	return d[key]
+}
+
+// StrOrList — значение data[key] как строка ИЛИ массив строк
+// (media_url в media_player_play приходит str|list). nil = поля нет
+// или формат чужой.
+func (e Event) StrOrList(key string) []string {
+	var d map[string]json.RawMessage
+	if json.Unmarshal(e.Data, &d) != nil {
+		return nil
+	}
+	raw, ok := d[key]
+	if !ok {
+		return nil
+	}
+	var one string
+	if json.Unmarshal(raw, &one) == nil {
+		return []string{one}
+	}
+	var many []string
+	if json.Unmarshal(raw, &many) == nil {
+		return many
+	}
+	return nil
 }
 
 // Has — есть ли ключ в data (отличить «нет данных» от нуля).
