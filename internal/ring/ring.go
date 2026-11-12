@@ -27,20 +27,22 @@ const (
 	leds          = 12
 
 	renderInterval    = 40 * time.Millisecond   // тик отрисовки (~25 fps сверху)
-	breathePeriod     = 800 * time.Millisecond  // интервал дыхания = вспышке
+	breathePeriod     = 1200 * time.Millisecond // период дыхания сцен (плавнее при ≤8 fps)
 	spinPeriod        = 1200 * time.Millisecond // оборот бегущего диода (thinking)
 	FLASH_MS          = 800 * time.Millisecond  // вспышка громкости: полный спад
 	animFrameInterval = 125 * time.Millisecond  // прореживание анимаций: ≤8 rebind/с
 
 	// HA-эффекты (Цвет/Пульсация/Вращение/Огонь): период 1.5 с, у пульса
-	// минимум почти до нуля (LVA-сцены дышат 800 мс с полом 0.15)
+	// минимум почти до нуля (LVA-сцены дышат 1.2 с с полом 0.15)
 	haPulsePeriod = 1500 * time.Millisecond
 	haSpinPeriod  = 1500 * time.Millisecond
 	haPulseMin    = 0.05
 
-	// «Огонь»: медленная волна + быстрая дрожь (мс), яркость 0.10..1
-	fireSlowMS = 1700
-	fireFastMS = 430
+	// «Огонь»: медленная волна + быстрая дрожь (мс), яркость 0.10..1.
+	// Периоды длинные, чтобы при ≤8 fps фаза между кадрами шагала мелко —
+	// короткая дрожь на 8 fps недосэмплируется и выглядит дёрганьем
+	fireSlowMS = 2400
+	fireFastMS = 850
 )
 
 // Палитра сцен (RGB). var, не const: литералы массивов в Go константами не бывают.
@@ -315,7 +317,7 @@ func fire(now time.Time, c [3]byte, scale float64) [12][3]byte {
 	for i := range px {
 		slow := math.Sin(2*math.Pi*ms/float64(fireSlowMS) + float64(i)*2.4)
 		fast := math.Sin(2*math.Pi*ms/float64(fireFastMS) + float64(i)*5.1)
-		px[i] = mul(c, (0.55 + 0.33*slow + 0.12*fast) * scale)
+		px[i] = mul(c, (0.55 + 0.35*slow + 0.10*fast) * scale)
 	}
 	return px
 }
