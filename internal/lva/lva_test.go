@@ -88,6 +88,16 @@ func TestServe(t *testing.T) {
 	}
 }
 
+// nil-клиент (при -lva "" lvaClient не создаётся) — Send/Connected no-op
+func TestNilClient(t *testing.T) {
+	var c *Client
+	c.Send("volume_changed", map[string]any{"volume": 0.5})
+	c.Send("media_player_state", nil)
+	if c.Connected() {
+		t.Fatal("nil-клиент не может быть подключён")
+	}
+}
+
 // StrOrList — media_url приходит строкой или списком строк
 func TestStrOrList(t *testing.T) {
 	ev := func(data string) Event {
