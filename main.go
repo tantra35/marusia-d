@@ -417,12 +417,13 @@ func main() {
 			}(conn)
 		}
 	}(*volapiAddr)
-	// reportVolume — репорт реальной громкости в LVA (команда volume_changed,
-	// доля ВИЗУАЛЬНОЙ шкалы 0..1): LVA синкает HA-сущность, репорт обратно НЕ
-	// переизлучается (разрыв петли). pct — физическая громкость sink.
-	reportVolume := func(pct int) {
+	// reportVolume — репорт реальной громкости в LVA (команда volume_changed):
+	// v — уже переведённая ВИЗУАЛЬНАЯ громкость 0..VOLUME_VISUAL_MAX, уходит
+	// долей 0..1. LVA синкает HA-сущность, репорт обратно НЕ переизлучается
+	// (разрыв петли).
+	reportVolume := func(v int) {
 		lvaClient.Send("volume_changed", map[string]any{
-			"volume": float64(toVisual(pct)) / VOLUME_VISUAL_MAX,
+			"volume": float64(v) / VOLUME_VISUAL_MAX,
 		})
 	}
 	// Громкость клавиш — всегда локальный шаг: демон владеет физической
@@ -447,8 +448,9 @@ func main() {
 			pct = 0
 		}
 		setSinkPct(pct)
-		volFeedback(toVisual(pct))
-		reportVolume(pct)
+		v := toVisual(pct)
+		volFeedback(v)
+		reportVolume(v)
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
 	// Производитель — touch-горутина; потребитель — ровно один (ниже):
@@ -608,8 +610,9 @@ func main() {
 				// volume_changed; применили sink — отрепортим правду
 				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
 				setSinkPct(pct)
-				volFeedback(toVisual(pct))
-				reportVolume(pct)
+				v := toVisual(pct)
+				volFeedback(v)
+				reportVolume(v)
 
 			case "media_player_play":
 				// HA запустил медиа: очередь mpd заменяется URL из команды
