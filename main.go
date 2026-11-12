@@ -299,28 +299,33 @@ func main() {
 	go mpdLink.Serve(ctx)
 
 	// ---------- LVA (периферийный API) ----------
-	var lvaClient *lva.Client
+	// Клиент существует ВСЕГДА — инвариант «lvaClient не бывает nil»:
+	// общие ветки (репорты volume_changed / media_player_state) зовут
+	// Send безусловно. Под условием только запуск сервера: при -lva ""
+	// он не стартует, conn вечно nil — Send молча глотает, Connected()
+	// = false, репорты уходят в никуда.
 	var lvaEventsCh <-chan lva.Event
-	if *lvaAddr != "" {
-		onConnect := func(c *lva.Client) {
-			if *lvaLight {
-				c.RegisterLight("Кольцо", "ring", []string{HA_EFFECT_COLOR, HA_EFFECT_PULSE, HA_EFFECT_SPIN, HA_EFFECT_FIRE})
-			}
-			// Колонка — внешний медиа-плеер: HA управляет воспроизведением
-			// через демон (инструкции media_player_*), демон репортит правду
-			// (media_player_state / volume_changed). Регистрация умирает
-			// вместе с коннектом — при каждом коннекте повторяем.
-			c.Send("register_media_player", nil)
-			// Начальный репорт: новый LVA не знает состояние нашего mpd
-			switch mpdLink.state() {
-			case "play":
-				c.Send("media_player_state", map[string]string{"state": "playing"})
-			case "pause":
-				c.Send("media_player_state", map[string]string{"state": "paused"})
-			}
+	var lvaClient *lva.Client
+	onConnect := func(c *lva.Client) {
+		if *lvaLight {
+			c.RegisterLight("Кольцо", "ring", []string{HA_EFFECT_COLOR, HA_EFFECT_PULSE, HA_EFFECT_SPIN, HA_EFFECT_FIRE})
 		}
-		srv := lva.New(*lvaAddr, onConnect)
-		lvaEventsCh, lvaClient = srv.Events(), srv.Client()
+		// Колонка — внешний медиа-плеер: HA управляет воспроизведением
+		// через демон (инструкции media_player_*), демон репортит правду
+		// (media_player_state / volume_changed). Регистрация умирает
+		// вместе с коннектом — при каждом коннекте повторяем.
+		c.Send("register_media_player", nil)
+		// Начальный репорт: новый LVA не знает состояние нашего mpd
+		switch mpdLink.state() {
+		case "play":
+			c.Send("media_player_state", map[string]string{"state": "playing"})
+		case "pause":
+			c.Send("media_player_state", map[string]string{"state": "paused"})
+		}
+	}
+	srv := lva.New(*lvaAddr, onConnect)
+	lvaEventsCh, lvaClient = srv.Events(), srv.Client()
+	if *lvaAddr != "" {
 		go srv.Serve(ctx)
 	}
 

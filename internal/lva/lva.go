@@ -41,13 +41,8 @@ type Client struct {
 // блокирует Send (а с ней — потребителя keyCh) навсегда.
 const sendTimeout = 2 * time.Second
 
-// Send шлёт команду; молча пропускает, если связи нет. c == nil — тоже
-// no-op: при -lva "" клиент не создаётся вовсе, а репорты из общих веток
-// (volume_changed, media_player_state) вызываются безусловно.
+// Send шлёт команду; молча пропускает, если связи нет.
 func (c *Client) Send(cmd string, data any) {
-	if c == nil {
-		return
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn == nil {
@@ -64,12 +59,8 @@ func (c *Client) Send(cmd string, data any) {
 }
 
 // Connected — есть ли живой клиент LVA. lvaClient != nil всегда истина
-// (объект создаётся в New), проверять надо именно соединение. При -lva ""
-// клиента нет вообще — nil.
+// (объект создаётся в New), проверять надо именно соединение.
 func (c *Client) Connected() bool {
-	if c == nil {
-		return false
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn != nil
