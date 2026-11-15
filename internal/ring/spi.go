@@ -1,6 +1,6 @@
 package ring
 
-// SPI-транспорт кольца: rebind контроллера + отправка кадра через spidev.
+// SPI-транспорт кольца: persistent fd на spidev0.0, кадр — один SPI_IOC_MESSAGE.
 //
 // Зависимости от железа (экспериментально проверено 2026-11-06/07, живая полоса):
 //   - бит → 4 SPI-бита: 0 → 1000b, 1 → 1100b («1»=1110 даёт high 0.9 мкс —
@@ -14,8 +14,10 @@ package ring
 //     разрывы на проводе защёлкивают мусор в хвосте цепочки — «сектор
 //     кольца не гаснет после вспышки» (vendor-путь на 40 циклах чист,
 //     наш bits=8 — нет; A/B 2026-11-07);
-//   - rebind контроллера (unbind/bind) перед КАЖДЫМ кадром: делитель SPI
-//     корректен только после probe, мульти-кадровые сессии не живут.
+//   - rebind контроллера (unbind/bind) перед КАЖДЫМ кадром больше НЕ нужен:
+//     ядро собрано с BSP-дисциплиной DMA (spi-meson-spicc: SMC=0 + XCH-старт,
+//     unprepare без teardown) — мульти-кадровые сессии живут (RAM-бут
+//     2026-11-14: 60 кадров подряд без rebind, кольцо циклит цвета).
 //
 // Все вызовы — только из актора (Serve).
 import (
@@ -37,7 +39,6 @@ const (
 	bytesPerLED  = 12                            // 24 бита × 4 SPI-бита / 8
 	spiMajor     = 153
 	spiMinor     = 0
-	rebindSettle = 15 * time.Millisecond // пауза unbind→bind
 )
 
 // encodeByte — байт → 4 байта SPI: бит 0 → 1000b, бит 1 → 1100b.
@@ -101,37 +102,43 @@ func iocMessage(n int) uintptr {
 	return 0x40000000 | uintptr(n*32)<<16 | 0x6B<<8
 }
 
-// draw — rebind + открыть узел + отправить кадр. Блокирует ~30–60 мс.
+// draw — открыть узел (один раз, fd живёт до spiClose) и отправить кадр.
+// Сам ioctl синхронный и быстрый (~1 мс на 400 байт): rebind контроллера
+// больше не нужен, см. заголовок файла.
 // ДМА-буферы — постоянные поля Ring (primeBuf/frameBuf): их физические
 // страницы не возвращаются ядру между кадрами, поэтому dma_sync при unmap
 // не может зацепить чужие ядерные структуры (источник порчи при чане
 // свежих буферов — см. Oops 2026-11-06).
 func (r *Ring) draw() error {
-	// unbind: «уже отвязан» игнорируем; bind: свежий probe → живой делитель
-	os.WriteFile("/sys/bus/platform/drivers/meson-spicc/unbind", []byte("ffd13000.spi"), 0644)
-	time.Sleep(rebindSettle)
-	if err := os.WriteFile("/sys/bus/platform/drivers/meson-spicc/bind", []byte("ffd13000.spi"), 0644); err != nil {
-		return fmt.Errorf("bind meson-spicc: %w", err)
+	if r.spiFile == nil {
+		f, err := r.openDev()
+		if err != nil {
+			return err
+		}
+		r.spiFile = f
 	}
-
-	f, err := r.openDev()
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 
 	tx := []spiXfer{
 		{txBuf: uint64(uintptr(unsafe.Pointer(&r.primeBuf[0]))), len: primeLen, speed: primeHz, bits: 64},
 		{txBuf: uint64(uintptr(unsafe.Pointer(&r.frameBuf[0]))), len: uint32(len(r.frameBuf)), speed: frameHz, bits: 64},
 	}
-	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocMessage(len(tx)), uintptr(unsafe.Pointer(&tx[0]))); e != 0 {
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, r.spiFile.Fd(), iocMessage(len(tx)), uintptr(unsafe.Pointer(&tx[0]))); e != 0 {
 		return fmt.Errorf("SPI_IOC_MESSAGE: %w", e)
 	}
 	return nil
 }
 
-// openDev — открыть узел; после rebind mdev может не успеть его создать —
-// создаём сами (mknod), висячий старый узел сносим.
+// spiClose — закрыть persistent fd (после финального чёрного кадра на
+// ctx.Done). Повторный draw переоткроет узел.
+func (r *Ring) spiClose() {
+	if r.spiFile != nil {
+		r.spiFile.Close()
+		r.spiFile = nil
+	}
+}
+
+// openDev — открыть узел; если не создан (mdev не успел) — создаём сами
+// (mknod), висячий старый узел сносим.
 func (r *Ring) openDev() (*os.File, error) {
 	for attempt := 0; attempt < 10; attempt++ {
 		f, err := os.OpenFile(spiDev, os.O_RDWR, 0)
@@ -145,7 +152,7 @@ func (r *Ring) openDev() (*os.File, error) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("%s не открылся после rebind", spiDev)
+	return nil, fmt.Errorf("%s не открылся", spiDev)
 }
 
 func mkdev(major, minor uint32) uint64 {
