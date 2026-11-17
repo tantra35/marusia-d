@@ -97,7 +97,10 @@ func TestFrameAnimationsBreathing(t *testing.T) {
 	r.dialog = "listening"
 	r.scale = 1
 
-	now := time.Now()
+	// фаза фиксированная (UnixNano = периоду дыхания): time.Now() ловит
+	// фазы, где синусоиды t и t+400 мс пересекаются (период/6) — яркость
+	// совпадает байт-в-байт и тест флапает
+	now := time.Unix(0, int64(breathePeriod))
 	key1, px1, anim1 := r.frame(now)
 	_, px2, anim2 := r.frame(now.Add(400 * time.Millisecond))
 	if key1 != "" || !anim1 || !anim2 {
