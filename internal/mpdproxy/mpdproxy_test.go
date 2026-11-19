@@ -166,6 +166,27 @@ func TestSetvolClamp(t *testing.T) {
 	}
 }
 
+func TestSetvolQuoted(t *testing.T) {
+	// libmpdclient цитирует число: «setvol "85"» — это валидный mpd-синтаксис
+	fb := newFakeBackend(t)
+	v := &volrec{cur: 50}
+	p := startProxy(t, fb.ln.Addr().String(), v.volume())
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, `setvol "85"`)
+	if got := readResp(t, br); len(got) != 1 || got[0] != "OK\n" {
+		t.Fatalf("setvol quoted: %q", got)
+	}
+	if len(v.sets) != 1 || v.sets[0] != 85 {
+		t.Fatalf("Set: %v", v.sets)
+	}
+	send(t, c, `volume "+5"`)
+	readResp(t, br)
+	if v.cur != 90 {
+		t.Fatalf("volume quoted relative: cur=%d", v.cur)
+	}
+}
+
 func TestVolumeRelative(t *testing.T) {
 	fb := newFakeBackend(t)
 	v := &volrec{cur: 50}

@@ -35,9 +35,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +55,16 @@ type Volume struct {
 // (дефолт 30 с) закрывает соединения без команд; ping каждые 15 с.
 const pingInterval = 15 * time.Second
 
+// debug — дамп всего трафика в stderr (env MARUSIA_MPDPROXY_DEBUG=1).
+// Для живой отладки: демон пускается руками из /tmp, stdout смотрит ssh.
+var debug bool
+
+func pdebug(id int, format string, args ...any) {
+	if debug {
+		log.Printf("mpdproxy[%d] %s", id, fmt.Sprintf(format, args...))
+	}
+}
+
 // Proxy — слушатель MPD-протокола. NotifyVolume безопасен на nil
 // (прокси может быть выключен флагом).
 type Proxy struct {
@@ -60,9 +72,10 @@ type Proxy struct {
 	backend string // реальный mpd (127.0.0.1:6601)
 	vol     Volume
 
-	mu    sync.Mutex
-	conns map[*pconn]struct{}
-	ln    net.Listener
+	mu     sync.Mutex
+	conns  map[*pconn]struct{}
+	ln     net.Listener
+	nextID int32
 }
 
 // New — создать прокси; запуск — Serve.
@@ -82,6 +95,7 @@ func (p *Proxy) Addr() string {
 
 // Serve — цикл accept до закрытия ctx.
 func (p *Proxy) Serve(ctx context.Context) {
+	debug = os.Getenv("MARUSIA_MPDPROXY_DEBUG") == "1"
 	ln, err := net.Listen("tcp", p.addr)
 	if err != nil {
 		log.Printf("mpdproxy: listen %s: %v", p.addr, err)
@@ -149,6 +163,7 @@ func (p *Proxy) idleCount() int {
 // построчный разбор команд. Любая ошибка любой стороны — рвём оба
 // (клиент переподключится сам).
 func (p *Proxy) handle(cli net.Conn) {
+	id := int(atomic.AddInt32(&p.nextID, 1))
 	be, err := net.Dial("tcp", p.backend)
 	if err != nil {
 		log.Printf("mpdproxy: бэкенд %s: %v", p.backend, err)
@@ -157,6 +172,7 @@ func (p *Proxy) handle(cli net.Conn) {
 	}
 	c := &pconn{
 		p:   p,
+		id:  id,
 		cli: cli,
 		clr: bufio.NewReader(cli),
 		clw: bufio.NewWriter(cli),
@@ -167,8 +183,12 @@ func (p *Proxy) handle(cli net.Conn) {
 	p.mu.Lock()
 	p.conns[c] = struct{}{}
 	p.mu.Unlock()
+	pdebug(id, "open %s", cli.RemoteAddr())
 
-	defer c.shutdown()
+	defer func() {
+		pdebug(id, "close")
+		c.shutdown()
+	}()
 
 	// приветствие mpd форвардим как есть — на версии могут сидеть
 	// проверки совместимости клиентов
@@ -199,6 +219,7 @@ func (p *Proxy) handle(cli net.Conn) {
 // pconn — одно клиентское соединение + его соединение к mpd.
 type pconn struct {
 	p   *Proxy
+	id  int
 	cli net.Conn
 	clr *bufio.Reader // читает клиентские команды (только dispatch-горутина)
 	clw *bufio.Writer // пишет клиенту (wmu)
@@ -225,17 +246,20 @@ func (c *pconn) dispatch(line string) bool {
 	// Любая команда кроме noidle на idle-соединении молча снимает idle
 	// (семантика mpd: ответ idle теряется, идёт ответ команды).
 	c.mu.Lock()
+	wasIdle := c.idle
 	if c.idle && cmd != "noidle" {
 		c.idle = false
+		pdebug(c.id, "idle отменён командой %q", cmd)
 	}
 	c.mu.Unlock()
+	pdebug(c.id, "cmd %q (idle был: %v)", line, wasIdle)
 
 	switch cmd {
 	case "setvol":
-		if len(fields) < 2 {
-			return c.ack(cmd, "нужен аргумент 0..100")
-		}
-		n, err := strconv.Atoi(fields[1])
+		// libmpdclient цитирует аргумент: на проводе «setvol "85"»
+		// (mpd-парсер кавычки легально снимает; у нас было источником
+		// ACK-ошибки, отравлявшей соединение upmpdcli)
+		n, err := strconv.Atoi(strings.Trim(fields[1], `"`))
 		if err != nil || n < 0 {
 			return c.ack(cmd, "некорректная громкость "+fields[1])
 		}
@@ -245,12 +269,13 @@ func (c *pconn) dispatch(line string) bool {
 		c.p.vol.Set(n)
 		c.writeLines("OK\n")
 	case "volume":
-		// deprecated-команда относительной громкости: «+10»/«-10»/«55».
-		// Не перехватывать нельзя — mixer none у mpd ответил бы ACK.
+		// deprecated-команда относительной громкости: «+10»/«-10»/«55»
+		// (возможно в кавычках — см. setvol). Не перехватывать нельзя —
+		// mixer none у mpd ответил бы ACK.
 		if len(fields) < 2 {
 			return c.ack(cmd, "нужен аргумент")
 		}
-		arg := fields[1]
+		arg := strings.Trim(fields[1], `"`)
 		cur := c.p.vol.Get()
 		if cur < 0 {
 			c.writeLines("OK\n") // громкость не узнали — молча no-op
@@ -299,6 +324,7 @@ func (c *pconn) dispatch(line string) bool {
 			c.idleFilter = nil
 		}
 		c.mu.Unlock()
+		pdebug(c.id, "idle ждёт, фильтр %v", fields[1:])
 	case "noidle":
 		// отмена ожидающего idle — пустой OK (иначе eventloop клиента висит)
 		c.mu.Lock()
@@ -326,6 +352,7 @@ func (c *pconn) dispatch(line string) bool {
 			if !inserted {
 				lines = append([]string{fmt.Sprintf("volume: %d\n", v)}, lines...)
 			}
+			pdebug(c.id, "status volume → %d", v)
 		}
 		c.writeLines(lines...)
 	case "close":
@@ -357,6 +384,7 @@ func (c *pconn) notifyMixer() {
 	}
 	c.idle = false
 	c.mu.Unlock()
+	pdebug(c.id, "notify changed: mixer")
 	c.writeLines("changed: mixer\n", "OK\n")
 }
 
@@ -366,9 +394,17 @@ func (c *pconn) backendExchange(line string) ([]string, error) {
 	c.bmu.Lock()
 	defer c.bmu.Unlock()
 	if err := c.backendWriteLocked(line); err != nil {
+		pdebug(c.id, "backend write err: %v", err)
 		return nil, err
 	}
-	return c.readResponseLocked()
+	lines, err := c.readResponseLocked()
+	if err != nil {
+		pdebug(c.id, "backend read err: %v", err)
+	} else if debug {
+		joined := strings.TrimSuffix(strings.Join(lines, ""), "\n")
+		pdebug(c.id, "backend ответ: %q", strings.ReplaceAll(joined, "\n", " | "))
+	}
+	return lines, err
 }
 
 // backendWrite — отправка без чтения ответа (close).
@@ -438,6 +474,7 @@ func (c *pconn) pingLoop() {
 		if !idle {
 			continue
 		}
+		pdebug(c.id, "ping бэкенду (клиент в idle)")
 		c.bmu.Lock()
 		if err := c.backendWriteLocked("ping"); err != nil {
 			c.bmu.Unlock()
