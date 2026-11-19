@@ -239,6 +239,54 @@ func TestTapDeliversPlayerEvents(t *testing.T) {
 	}
 }
 
+func TestPendingFlushOnIdleRegistration(t *testing.T) {
+	// событие mpd приходит, когда ни один клиент не в idle (окно
+	// обработки upmpdcli) — не теряется, а выдаётся при регистрации idle
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				fmt.Fprint(c, "OK MPD 0.24.0\n")
+				br := bufio.NewReader(c)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					cmd := strings.TrimSpace(line)
+					if cmd == "ping" {
+						fmt.Fprint(c, "OK\n")
+					} else if strings.HasPrefix(cmd, "idle") {
+						fmt.Fprint(c, "changed: player\nOK\n")
+					} else {
+						fmt.Fprint(c, "OK\n")
+					}
+				}
+			}(c)
+		}
+	}()
+	v := (&volrec{cur: 50}).volume()
+	p := startProxy(t, ln.Addr().String(), v)
+	// tap успевает потребить событие до появления клиента
+	time.Sleep(300 * time.Millisecond)
+
+	br, c := dialProxy(t, p.Addr())
+	send(t, c, "idle player")
+	got := readResp(t, br)
+	if len(got) != 2 || got[0] != "changed: player\n" || got[1] != "OK\n" {
+		t.Fatalf("pending flush: %q", got)
+	}
+}
+
 func TestVolumeRelative(t *testing.T) {
 	fb := newFakeBackend(t)
 	v := &volrec{cur: 50}

@@ -85,15 +85,20 @@ type Proxy struct {
 	backend string // реальный mpd (127.0.0.1:6601)
 	vol     Volume
 
-	mu     sync.Mutex
-	conns  map[*pconn]struct{}
-	ln     net.Listener
-	nextID int32
+	mu    sync.Mutex
+	conns map[*pconn]struct{}
+	ln    net.Listener
+	// pending — события, для которых не нашлось ни одного idle-клиента
+	// (клиенты выходят из idle на обработку и возвращаются не мгновенно):
+	// выдаются сразу при следующей регистрации idle — семантика буфера
+	// самого mpd, без них клиент терял бы события в окне обработки
+	nextID  int32
+	pending map[string]bool
 }
 
 // New — создать прокси; запуск — Serve.
 func New(addr, backend string, vol Volume) *Proxy {
-	return &Proxy{addr: addr, backend: backend, vol: vol, conns: make(map[*pconn]struct{})}
+	return &Proxy{addr: addr, backend: backend, vol: vol, conns: make(map[*pconn]struct{}), pending: make(map[string]bool)}
 }
 
 // Addr — фактический адрес слушателя (пусто до старта Serve).
@@ -146,15 +151,25 @@ func (p *Proxy) Serve(ctx context.Context) {
 }
 
 // NotifyVolume — громкость изменилась (любой источник): все соединения,
-// сидящие в idle с интересом к mixer, получают «changed: mixer».
+// сидящие в idle с интересом к mixer, получают «changed: mixer»; если
+// idle-клиентов нет — событие копится в pending и уйдёт при следующей
+// регистрации idle.
 func (p *Proxy) NotifyVolume() {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	delivered := false
 	for c := range p.conns {
-		c.notifyMixer()
+		if c.notifySubsystem("mixer") {
+			delivered = true
+		}
+	}
+	if !delivered {
+		p.pending["mixer"] = true
+	} else {
+		delete(p.pending, "mixer")
 	}
 }
 
@@ -171,6 +186,17 @@ func (p *Proxy) idleCount() int {
 		c.mu.Unlock()
 	}
 	return n
+}
+
+// pendingSnapshot — копия набора непри delivered-событий (для логов).
+func (p *Proxy) pendingSnapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.pending))
+	for sub := range p.pending {
+		out = append(out, sub)
+	}
+	return out
 }
 
 // handle — жизнь одного клиентского соединения: баннер от mpd, затем
@@ -326,7 +352,10 @@ func (c *pconn) dispatch(line string) bool {
 		c.writeLines("OK\n")
 	case "idle":
 		// Не блокируем чтение: idle «висит» просто потому, что мы не
-		// отвечаем, — до NotifyVolume/noidle/чужой команды.
+		// отвечаем, — до NotifyVolume/noidle/чужой команды. Регистрация
+		// и выдача накопленных событий — атомарно под p.mu, иначе
+		// событие могло бы прийти между регистрацией и выдачей.
+		c.p.mu.Lock()
 		c.mu.Lock()
 		c.idle = true
 		if len(fields) > 1 {
@@ -337,8 +366,29 @@ func (c *pconn) dispatch(line string) bool {
 		} else {
 			c.idleFilter = nil
 		}
+		var flush []string
+		for sub := range c.p.pending {
+			if c.idleFilter == nil || c.idleFilter[sub] {
+				flush = append(flush, sub)
+			}
+		}
+		for _, sub := range flush {
+			delete(c.p.pending, sub)
+		}
+		if len(flush) > 0 {
+			c.idle = false
+		}
 		c.mu.Unlock()
-		pdebug(c.id, "idle ждёт, фильтр %v", fields[1:])
+		c.p.mu.Unlock()
+		pdebug(c.id, "idle ждёт, фильтр %v, flush %v", fields[1:], flush)
+		if len(flush) > 0 {
+			lines := make([]string, 0, len(flush)+1)
+			for _, sub := range flush {
+				lines = append(lines, "changed: "+sub+"\n")
+			}
+			lines = append(lines, "OK\n")
+			c.writeLines(lines...)
+		}
 	case "noidle":
 		// отмена ожидающего idle — пустой OK (иначе eventloop клиента висит)
 		c.mu.Lock()
@@ -388,24 +438,20 @@ func (c *pconn) dispatch(line string) bool {
 	return true
 }
 
-// notifyMixer — синтетический «changed: mixer» ожидающему idle-соединению
-// (если оно подписано на mixer). Вызывается под p.mu.
-func (c *pconn) notifyMixer() {
-	c.notifySubsystem("mixer")
-}
-
-// notifySubsystem — раздача реального mpd-события (tap) или синтетического
-// mixer ожидающему idle-соединению с совпадающим фильтром. Вызывается под p.mu.
-func (c *pconn) notifySubsystem(sub string) {
+// notifySubsystem — раздача события (tap или синтетический mixer)
+// ожидающему idle-соединению с совпадающим фильтром. Возвращает true,
+// если событие доставлено. Вызывается под p.mu.
+func (c *pconn) notifySubsystem(sub string) bool {
 	c.mu.Lock()
 	if !c.idle || (c.idleFilter != nil && !c.idleFilter[sub]) {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	c.idle = false
 	c.mu.Unlock()
 	pdebug(c.id, "notify changed: %s", sub)
 	c.writeLines("changed: "+sub+"\n", "OK\n")
+	return true
 }
 
 // tapLoop — собственное idle-подключение прокси к mpd: слушает реальные
@@ -414,6 +460,7 @@ func (c *pconn) notifySubsystem(sub string) {
 // mixer — player/queue/options события mpd (stop, конец трека, смена
 // очереди) до upmpdcli не доходили, и контроллеры залипали в «PLAYING».
 func (p *Proxy) tapLoop(ctx context.Context) {
+tapFor:
 	for {
 		if ctx.Err() != nil {
 			return
@@ -447,14 +494,25 @@ func (p *Proxy) tapLoop(ctx context.Context) {
 				}
 				armed = false
 			}
-			// читаем ответ idle: строки changed: X … до OK
+			// читаем ответ idle: строки changed: X … до OK. Дедлайн длинный:
+			// mpd молчит, пока не будет события; короткий дедлайн рвал
+			// соединение каждые 30 с и терял события в окнах реконнекта
 			var subs []string
 			done := false
+			var rerr error
 			for {
-				be.SetReadDeadline(time.Now().Add(30 * time.Second))
+				be.SetReadDeadline(time.Now().Add(120 * time.Second))
 				l, err := br.ReadString('\n')
 				if err != nil {
 					be.SetReadDeadline(time.Time{})
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						// idle молчал (дедлайн) — mpd события не теряем:
+						// перевооружаем idle на том же соединении, БЕЗ
+						// разрыва (разрыв терял события в окне реконнекта)
+						armed = true
+						break
+					}
+					rerr = err
 					goto connDead
 				}
 				be.SetReadDeadline(time.Time{})
@@ -472,18 +530,30 @@ func (p *Proxy) tapLoop(ctx context.Context) {
 			if done && len(subs) > 0 {
 				p.mu.Lock()
 				for _, sub := range subs {
+					delivered := false
 					for c := range p.conns {
-						c.notifySubsystem(sub)
+						if c.notifySubsystem(sub) {
+							delivered = true
+						}
+					}
+					// некому доставлять — клиент в окне обработки
+					// предыдущего события: копим до следующего idle
+					if delivered {
+						delete(p.pending, sub)
+					} else {
+						p.pending[sub] = true
 					}
 				}
 				p.mu.Unlock()
-				pdebug(0, "tap события: %v", subs)
+				pdebug(0, "tap события: %v (pending %v)", subs, p.pendingSnapshot())
 			}
+		connDead:
+			be.Close()
+			log.Printf("mpdproxy tap: связь потеряна (err=%v; повтор через 2с)", rerr)
+			rerr = nil
+			sleepCtx2(ctx, 2*time.Second)
+			continue tapFor // иначе застряли бы в armed-цикле на мёртвом br
 		}
-	connDead:
-		be.Close()
-		log.Printf("mpdproxy tap: связь потеряна (повтор через 2с)")
-		sleepCtx2(ctx, 2*time.Second)
 	}
 }
 
