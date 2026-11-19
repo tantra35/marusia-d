@@ -187,6 +187,58 @@ func TestSetvolQuoted(t *testing.T) {
 	}
 }
 
+func TestTapDeliversPlayerEvents(t *testing.T) {
+	// фейковый бэкенд отвечает на idle событием player — прокси должен
+	// раздасть его ожидающему клиенту (раньше player-события терялись:
+	// контроллер залипал в «PLAYING» после stop)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				fmt.Fprint(c, "OK MPD 0.24.0\n")
+				br := bufio.NewReader(c)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					cmd := strings.TrimSpace(line)
+					switch {
+					case cmd == "ping":
+						fmt.Fprint(c, "OK\n")
+					case strings.HasPrefix(cmd, "idle"):
+						// каждый idle завершается событием — как в реальном
+						// mpd при постоянных изменениях состояния
+						fmt.Fprint(c, "changed: player\nOK\n")
+					default:
+						fmt.Fprint(c, "OK\n")
+					}
+				}
+			}(c)
+		}
+	}()
+	v := (&volrec{cur: 50}).volume()
+	p := startProxy(t, ln.Addr().String(), v)
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, "idle player")
+	// tap-событие может прийти мгновенно и снять idle до нашей проверки —
+	// просто читаем ответ (дедлайн коннекта 3 с из dialProxy)
+	got := readResp(t, br)
+	if len(got) != 2 || got[0] != "changed: player\n" || got[1] != "OK\n" {
+		t.Fatalf("tap player event: %q", got)
+	}
+}
+
 func TestVolumeRelative(t *testing.T) {
 	fb := newFakeBackend(t)
 	v := &volrec{cur: 50}

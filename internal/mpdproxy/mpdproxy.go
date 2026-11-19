@@ -16,10 +16,17 @@
 //	                       «volume: -1» (при mixer none) на реальную
 //	                       визуальную громкость — без этого upmpdcli
 //	                       раздаёт контроллерам мусор;
-//	idle [subs...]       → соединение переводится в ожидание; при смене
-//	                       громкости (NotifyVolume) получает синтетический
-//	                       «changed: mixer» — штатный путь, которым
-//	                       upmpdcli публикует громкость в RenderingControl.
+//	idle [subs...]       → соединение переводится в ожидание; события
+//	                       раздаются через tap (см. ниже): реальные
+//	                       player/queue/options события mpd + синтетический
+//	                       «changed: mixer» при смене громкости (NotifyVolume)
+//	                       — штатный путь, которым upmpdcli публикует
+//	                       состояние в RenderingControl/AVTransport.
+//
+// Tap: прокси держит собственное idle-подключение к mpd и раздаёт реальные
+// события ожидающим клиентам по их фильтрам. Без tap клиент застревал бы в
+// устаревшем состоянии: mpd-события stop/конец-трека/смена-очереди до него
+// не доходили бы никогда.
 //
 // Стейт-машина пер-соединение: «кто в idle» — атрибут коннекта (mpd-клиенты
 // многосоединённые, upmpdcli держит командное и idle-соединение отдельно).
@@ -55,12 +62,18 @@ type Volume struct {
 // (дефолт 30 с) закрывает соединения без команд; ping каждые 15 с.
 const pingInterval = 15 * time.Second
 
+// idleMask — маска tap-подписки на события mpd: объединение того, что
+// запрашивают клиенты (у upmpdcli — playlist player mixer options,
+// mpdcli.cxx:199-203). События вне фильтра конкретного клиента
+// отсеиваются при раздаче.
+const idleMask = "playlist player mixer options"
+
 // debug — дамп всего трафика в stderr (env MARUSIA_MPDPROXY_DEBUG=1).
 // Для живой отладки: демон пускается руками из /tmp, stdout смотрит ssh.
-var debug bool
+var debug atomic.Bool
 
 func pdebug(id int, format string, args ...any) {
-	if debug {
+	if debug.Load() {
 		log.Printf("mpdproxy[%d] %s", id, fmt.Sprintf(format, args...))
 	}
 }
@@ -95,7 +108,7 @@ func (p *Proxy) Addr() string {
 
 // Serve — цикл accept до закрытия ctx.
 func (p *Proxy) Serve(ctx context.Context) {
-	debug = os.Getenv("MARUSIA_MPDPROXY_DEBUG") == "1"
+	debug.Store(os.Getenv("MARUSIA_MPDPROXY_DEBUG") == "1")
 	ln, err := net.Listen("tcp", p.addr)
 	if err != nil {
 		log.Printf("mpdproxy: listen %s: %v", p.addr, err)
@@ -118,6 +131,7 @@ func (p *Proxy) Serve(ctx context.Context) {
 		}
 	}()
 	log.Printf("mpdproxy: слушаю %s → %s", p.addr, p.backend)
+	go p.tapLoop(ctx)
 	for {
 		cli, err := ln.Accept()
 		if err != nil {
@@ -377,15 +391,109 @@ func (c *pconn) dispatch(line string) bool {
 // notifyMixer — синтетический «changed: mixer» ожидающему idle-соединению
 // (если оно подписано на mixer). Вызывается под p.mu.
 func (c *pconn) notifyMixer() {
+	c.notifySubsystem("mixer")
+}
+
+// notifySubsystem — раздача реального mpd-события (tap) или синтетического
+// mixer ожидающему idle-соединению с совпадающим фильтром. Вызывается под p.mu.
+func (c *pconn) notifySubsystem(sub string) {
 	c.mu.Lock()
-	if !c.idle || (c.idleFilter != nil && !c.idleFilter["mixer"]) {
+	if !c.idle || (c.idleFilter != nil && !c.idleFilter[sub]) {
 		c.mu.Unlock()
 		return
 	}
 	c.idle = false
 	c.mu.Unlock()
-	pdebug(c.id, "notify changed: mixer")
-	c.writeLines("changed: mixer\n", "OK\n")
+	pdebug(c.id, "notify changed: %s", sub)
+	c.writeLines("changed: "+sub+"\n", "OK\n")
+}
+
+// tapLoop — собственное idle-подключение прокси к mpd: слушает реальные
+// события и раздаёт их локально-ожидающим клиентам. НЕОБХОДИМО: до него
+// прокси перехватывал idle клиентов и подсовывал только синтетический
+// mixer — player/queue/options события mpd (stop, конец трека, смена
+// очереди) до upmpdcli не доходили, и контроллеры залипали в «PLAYING».
+func (p *Proxy) tapLoop(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		be, err := net.Dial("tcp", p.backend)
+		if err != nil {
+			log.Printf("mpdproxy tap: dial %s: %v (повтор через 2с)", p.backend, err)
+			sleepCtx2(ctx, 2*time.Second)
+			continue
+		}
+		br := bufio.NewReader(be)
+		bw := bufio.NewWriter(be)
+		// баннер пропустить
+		if _, err := br.ReadString('\n'); err != nil {
+			be.Close()
+			sleepCtx2(ctx, 2*time.Second)
+			continue
+		}
+		log.Printf("mpdproxy tap: слушаю события mpd (%s)", idleMask)
+		armed := true
+		for {
+			if armed {
+				be.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_, err = bw.WriteString("idle " + idleMask + "\n")
+				if err == nil {
+					err = bw.Flush()
+				}
+				be.SetWriteDeadline(time.Time{})
+				if err != nil {
+					break
+				}
+				armed = false
+			}
+			// читаем ответ idle: строки changed: X … до OK
+			var subs []string
+			done := false
+			for {
+				be.SetReadDeadline(time.Now().Add(30 * time.Second))
+				l, err := br.ReadString('\n')
+				if err != nil {
+					be.SetReadDeadline(time.Time{})
+					goto connDead
+				}
+				be.SetReadDeadline(time.Time{})
+				l = strings.TrimSpace(l)
+				if strings.HasPrefix(l, "changed: ") {
+					subs = append(subs, strings.TrimPrefix(l, "changed: "))
+					continue
+				}
+				if l == "OK" || strings.HasPrefix(l, "ACK ") {
+					done = true
+				}
+				break
+			}
+			armed = true
+			if done && len(subs) > 0 {
+				p.mu.Lock()
+				for _, sub := range subs {
+					for c := range p.conns {
+						c.notifySubsystem(sub)
+					}
+				}
+				p.mu.Unlock()
+				pdebug(0, "tap события: %v", subs)
+			}
+		}
+	connDead:
+		be.Close()
+		log.Printf("mpdproxy tap: связь потеряна (повтор через 2с)")
+		sleepCtx2(ctx, 2*time.Second)
+	}
+}
+
+func sleepCtx2(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 // backendExchange — команда к mpd и сбор ответа до OK/ACK. Вызывается
@@ -400,7 +508,7 @@ func (c *pconn) backendExchange(line string) ([]string, error) {
 	lines, err := c.readResponseLocked()
 	if err != nil {
 		pdebug(c.id, "backend read err: %v", err)
-	} else if debug {
+	} else if debug.Load() {
 		joined := strings.TrimSuffix(strings.Join(lines, ""), "\n")
 		pdebug(c.id, "backend ответ: %q", strings.ReplaceAll(joined, "\n", " | "))
 	}
