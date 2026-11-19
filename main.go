@@ -1,6 +1,7 @@
 // marusia-d — демон периферии колонки VK Mini (Маруся):
 // световое кольцо (SPI), сенсорная панель (evdev), панель-часы (seg-led),
-// датчик света (IIO), состояние музыки — от MPD, диалог ассистента — от LVA.
+// датчик света (IIO), состояние музыки — от MPD, диалог ассистента — от LVA,
+// MPD-протокольный прокси для upmpdcli (громкость DLNA-контроллеров).
 //
 // Источники событий → state machine → рендер:
 //
@@ -22,13 +23,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"math"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,6 +40,7 @@ import (
 	"marusia-d/internal/clock"
 	"marusia-d/internal/light"
 	"marusia-d/internal/lva"
+	"marusia-d/internal/mpdproxy"
 	"marusia-d/internal/ring"
 	"marusia-d/internal/touch"
 
@@ -241,14 +241,14 @@ const (
 )
 
 func main() {
-	mpdAddr := flag.String("mpd", "127.0.0.1:6600", "адрес MPD")
+	mpdAddr := flag.String("mpd", "127.0.0.1:6601", "адрес MPD (за прокси)")
 	lvaAddr := flag.String("lva", ":6055", "слушать LVA peripheral API на этом адресе; пусто = выключено")
 	lvaLight := flag.Bool("lva-light", true, "регистрировать кольцо как light-сущность HA")
-	volapiAddr := flag.String("volapi", "127.0.0.1:6056", "слушать volume-API (upmpdcli externalvolumecontrol) на этом адресе; пусто = выключено")
+	proxyAddr := flag.String("mpdproxy", "127.0.0.1:6600", "слушать MPD-протокол для upmpdcli на этом адресе; пусто = выключено")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime)
-	log.Printf("marusia-d старт: mpd=%s lva=%q volapi=%q", *mpdAddr, *lvaAddr, *volapiAddr)
+	log.Printf("marusia-d старт: mpd=%s lva=%q mpdproxy=%q", *mpdAddr, *lvaAddr, *proxyAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -346,85 +346,39 @@ func main() {
 		}
 	}
 
-	// ---------- volume API для upmpdcli (externalvolumecontrol) ----------
-	// mpd при mixer_type none громкость не регулирует: DLNA-слайдер доезжает
-	// через хуки upmpdcli (getexternalvolume/onvolumechange — dumb-пайпы
-	// printf | nc на этот listener). Протокол построчный:
-	//   GET          → визуальные 0..100 (текущий sink);
-	//   SET <0..100> → sink = round(v*1.5), отклик кольцо/панель/звук.
-	// Шкала: визуальная 0..VOLUME_VISUAL_MAX ↔ физическая 0..VOLUME_MAX_PCT.
-	go func(addr string) {
-		if addr == "" {
-			return
-		}
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			log.Printf("volapi: %v — DLNA-громкость через upmpdcli не работает", err)
-			return
-		}
-		go func() {
-			<-ctx.Done()
-			ln.Close()
-		}()
-		log.Printf("volapi: слушаю %s", addr)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("volapi: accept: %v", err)
-				continue
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				conn.SetDeadline(time.Now().Add(2 * time.Second))
-				sc := bufio.NewScanner(conn)
-				if !sc.Scan() {
-					return
-				}
-				fields := strings.Fields(strings.TrimSpace(sc.Text()))
-				if len(fields) == 0 {
-					return
-				}
-				switch fields[0] {
-				case "GET":
-					p := getSinkPct()
-					if p < 0 {
-						p = 0
-					}
-					if p > VOLUME_MAX_PCT {
-						p = VOLUME_MAX_PCT
-					}
-					fmt.Fprintf(conn, "%d\n", toVisual(p))
-				case "SET":
-					if len(fields) < 2 {
-						return
-					}
-					v, err := strconv.Atoi(fields[1])
-					if err != nil || v < 0 {
-						log.Printf("volapi: SET %q: не число", fields[1])
-						return
-					}
-					// v∈0..100: fromVisual — на сетку инкремента клавиш
-					// (кламп внутри), отклик — от итогового значения
-					p := fromVisual(v)
-					setSinkPct(p)
-					volFeedback(toVisual(p))
-				default:
-					log.Printf("volapi: неизвестная команда %q", fields[0])
-				}
-			}(conn)
-		}
-	}(*volapiAddr)
-	// reportVolume — репорт реальной громкости в LVA (команда volume_changed):
-	// v — уже переведённая ВИЗУАЛЬНАЯ громкость 0..VOLUME_VISUAL_MAX, уходит
-	// долей 0..1. LVA синкает HA-сущность, репорт обратно НЕ переизлучается
-	// (разрыв петли).
+	// ---------- MPD-протокольный прокси (upmpdcli ↔ marusia-d ↔ mpd) ----------
+	// mpd при mixer_type none громкость не регулирует: до 2026-11-19 DLNA
+	// доезжала через хуки upmpdcli (getexternalvolume/onvolumechange →
+	// volapi :6056). Теперь upmpdcli говорит MPD-протокол с прокси
+	// (см. internal/mpdproxy): setvol/volume — громкость sink, status —
+	// переписанный volume:, idle — синтетический changed: mixer при
+	// любом изменении громкости. Хуки и volapi снесены.
+	// reportVolume — репорт реальной громкости в LVA (команда
+	// volume_changed): v — уже переведённая ВИЗУАЛЬНАЯ громкость
+	// 0..VOLUME_VISUAL_MAX, уходит долей 0..1. LVA синкает HA-сущность,
+	// репорт обратно НЕ переизлучается (разрыв петли).
 	reportVolume := func(v int) {
 		lvaClient.Send("volume_changed", map[string]any{
 			"volume": float64(v) / VOLUME_VISUAL_MAX,
 		})
+	}
+	// applyUserVolume — ЕДИНАЯ точка применения пользовательской громкости
+	// (физическая 0..VOLUME_MAX_PCT): sink + отклик (звук/кольцо/панель) +
+	// репорт LVA + нотификация idle-соединений прокси (контроллеры DLNA).
+	var mpdProxy *mpdproxy.Proxy
+	applyUserVolume := func(p int) {
+		setSinkPct(p)
+		v := toVisual(p)
+		volFeedback(v)
+		reportVolume(v)
+		mpdProxy.NotifyVolume()
+	}
+	if *proxyAddr != "" {
+		mpdProxy = mpdproxy.New(*proxyAddr, *mpdAddr, mpdproxy.Volume{
+			Get: func() int { return toVisual(getUserPct()) },
+			Set: func(v int) { applyUserVolume(fromVisual(v)) },
+		})
+		go mpdProxy.Serve(ctx)
 	}
 	// Громкость клавиш — всегда локальный шаг: демон владеет физической
 	// громкостью sink (get → snap → ±10 → кламп → set). Команд volume_up/down
@@ -447,10 +401,7 @@ func main() {
 		} else if pct < 0 { // 5-10=-5 → пол
 			pct = 0
 		}
-		setSinkPct(pct)
-		v := toVisual(pct)
-		volFeedback(v)
-		reportVolume(v)
+		applyUserVolume(pct)
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
 	// Производитель — touch-горутина; потребитель — ровно один (ниже):
@@ -545,8 +496,13 @@ func main() {
 					// ×100 — это визуальные 0..100 (шкала toVisual);
 					// sink — источник истины по громкости колонки,
 					// синхронизируем при коннекте: fromVisual — сразу
-					// физическая шкала на сетке инкремента клавиш
-					setSinkPct(fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX))))
+					// физическая шкала на сетке инкремента клавиш.
+					// Без отклика (звук/вспышка) и репорта (петля), но
+					// с нотификацией прокси — контроллеры DLNA должны
+					// узнать новую громкость
+					p := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
+					setSinkPct(p)
+					mpdProxy.NotifyVolume()
 				}
 				if e.Has("ducked") {
 					// duck_changed — state-событие, LVA реплеит его в
@@ -597,11 +553,7 @@ func main() {
 			case "media_player_set_volume":
 				// HA слайдер/мьют внешнему плееру: та же шкала, что у
 				// volume_changed; применили sink — отрепортим правду
-				pct := fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX)))
-				setSinkPct(pct)
-				v := toVisual(pct)
-				volFeedback(v)
-				reportVolume(v)
+				applyUserVolume(fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX))))
 
 			case "media_player_play":
 				// HA запустил медиа: очередь mpd заменяется URL из команды
