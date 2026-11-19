@@ -376,7 +376,18 @@ func main() {
 	if *proxyAddr != "" {
 		mpdProxy = mpdproxy.New(*proxyAddr, *mpdAddr, mpdproxy.Volume{
 			Get: func() int { return toVisual(getUserPct()) },
-			Set: func(v int) { applyUserVolume(fromVisual(v)) },
+			Set: func(v int) {
+				// дедупликация: HA шлёт SetVolume дважды (два SOAP с одним
+				// значением) — второй применяет тот же snapped sink. Голая
+				// перезапись слышалась бы как второй блип отклика; skipping
+				// рвёт и эхо-циклы (LastChange → повторный SetVolume)
+				p := fromVisual(v)
+				if p == snapPct(getUserPct()) {
+					log.Printf("mpdproxy: setvol %d — дубль текущего (snap %d), no-op", v, p)
+					return
+				}
+				applyUserVolume(p)
+			},
 		})
 		go mpdProxy.Serve(ctx)
 	}
