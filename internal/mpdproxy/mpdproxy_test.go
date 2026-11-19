@@ -10,18 +10,26 @@ import (
 	"time"
 )
 
-// fakeBackend — минимальный mpd: баннер, status с volume: -1, эхо-OK.
+// fakeBackend — минимальный mpd: баннер, status, эхо-OK. statusVolume:
+// "" = строка volume НЕ отдаётся (mpd 0.24 при mixer none), "-1" = стиль
+// mpd 0.23, прочее — конкретное значение (для теста переписи).
 type fakeBackend struct {
-	ln net.Listener
+	ln           net.Listener
+	statusVolume string
+	banner       string
 }
 
 func newFakeBackend(t *testing.T) *fakeBackend {
+	return newFakeBackendV(t, "") // по умолчанию — поведение mpd 0.24 на плате
+}
+
+func newFakeBackendV(t *testing.T, statusVolume string) *fakeBackend {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb := &fakeBackend{ln: ln}
+	fb := &fakeBackend{ln: ln, statusVolume: statusVolume, banner: "OK MPD 0.24.0\n"}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -37,7 +45,7 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 
 func (fb *fakeBackend) serve(c net.Conn) {
 	defer c.Close()
-	fmt.Fprint(c, "OK MPD 0.23.5\n")
+	fmt.Fprint(c, fb.banner)
 	br := bufio.NewReader(c)
 	for {
 		line, err := br.ReadString('\n')
@@ -47,7 +55,10 @@ func (fb *fakeBackend) serve(c net.Conn) {
 		cmd := strings.TrimSpace(line)
 		switch {
 		case cmd == "status":
-			fmt.Fprint(c, "volume: -1\nrepeat: 0\nstate: play\nOK\n")
+			if fb.statusVolume != "" {
+				fmt.Fprintf(c, "volume: %s\n", fb.statusVolume)
+			}
+			fmt.Fprint(c, "repeat: 0\nstate: play\nOK\n")
 		default:
 			fmt.Fprint(c, "OK\n")
 		}
@@ -65,7 +76,7 @@ func dialProxy(t *testing.T, addr string) (*bufio.Reader, net.Conn) {
 	c.SetDeadline(time.Now().Add(3 * time.Second))
 	br := bufio.NewReader(c)
 	greeting, err := br.ReadString('\n')
-	if err != nil || greeting != "OK MPD 0.23.5\n" {
+	if err != nil || greeting != "OK MPD 0.24.0\n" {
 		t.Fatalf("баннер: %q err=%v", greeting, err)
 	}
 	return br, c
@@ -174,7 +185,23 @@ func TestVolumeRelative(t *testing.T) {
 }
 
 func TestStatusRewritesVolume(t *testing.T) {
-	fb := newFakeBackend(t)
+	// mpd 0.24 на плате: строки volume НЕТ — прокси вставляет её первой
+	fb := newFakeBackend(t) // statusVolume=""
+	v := &volrec{cur: 77}
+	p := startProxy(t, fb.ln.Addr().String(), v.volume())
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, "status")
+	got := readResp(t, br)
+	want := []string{"volume: 77\n", "repeat: 0\n", "state: play\n", "OK\n"}
+	if strings.Join(got, "") != strings.Join(want, "") {
+		t.Fatalf("status: %q, хотим %q", got, want)
+	}
+}
+
+func TestStatusRewritesLegacyVolumeLine(t *testing.T) {
+	// mpd 0.23-стиль: «volume: -1» переписывается на месте
+	fb := newFakeBackendV(t, "-1")
 	v := &volrec{cur: 77}
 	p := startProxy(t, fb.ln.Addr().String(), v.volume())
 	br, c := dialProxy(t, p.Addr())

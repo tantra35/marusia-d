@@ -310,12 +310,21 @@ func (c *pconn) dispatch(line string) bool {
 		if err != nil {
 			return false
 		}
-		// mixer none у mpd — volume: -1; подставляем реальную громкость
+		// mixer none: mpd 0.23 отдавал «volume: -1», 0.24 строку ВООБЩЕ
+		// опускает. Переписываем найденную, при отсутствии — вставляем
+		// первой (volume — первая строка статуса mpd): без неё upmpdcli
+		// не видит громкости и контроллерам раздаётся пустота
 		if v := c.p.vol.Get(); v >= 0 {
+			inserted := false
 			for i, l := range lines {
 				if strings.HasPrefix(l, "volume:") {
 					lines[i] = fmt.Sprintf("volume: %d\n", v)
+					inserted = true
+					break
 				}
+			}
+			if !inserted {
+				lines = append([]string{fmt.Sprintf("volume: %d\n", v)}, lines...)
 			}
 		}
 		c.writeLines(lines...)
