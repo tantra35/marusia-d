@@ -366,7 +366,8 @@ func main() {
 	// (физическая 0..VOLUME_MAX_PCT): sink + отклик (звук/кольцо/панель) +
 	// репорт LVA + нотификация idle-соединений прокси (контроллеры DLNA).
 	var mpdProxy *mpdproxy.Proxy
-	applyUserVolume := func(p int) {
+	applyUserVolume := func(from string, p int) {
+		log.Printf("vol: применяю %s → sink %d%%", from, p)
 		setSinkPct(p)
 		v := toVisual(p)
 		volFeedback(v)
@@ -383,10 +384,10 @@ func main() {
 				// рвёт и эхо-циклы (LastChange → повторный SetVolume)
 				p := fromVisual(v)
 				if p == snapPct(getUserPct()) {
-					log.Printf("mpdproxy: setvol %d — дубль текущего (snap %d), no-op", v, p)
+					log.Printf("vol: DLNA setvol %d — дубль текущего (snap %d), no-op", v, p)
 					return
 				}
-				applyUserVolume(p)
+				applyUserVolume("DLNA", p)
 			},
 		})
 		go mpdProxy.Serve(ctx)
@@ -412,7 +413,7 @@ func main() {
 		} else if pct < 0 { // 5-10=-5 → пол
 			pct = 0
 		}
-		applyUserVolume(pct)
+		applyUserVolume("кнопки", pct)
 	}
 	// keyCh — ЕДИНЫЙ небуферизированный канал действий с клавиатуры.
 	// Производитель — touch-горутина; потребитель — ровно один (ниже):
@@ -564,7 +565,8 @@ func main() {
 			case "media_player_set_volume":
 				// HA слайдер/мьют внешнему плееру: та же шкала, что у
 				// volume_changed; применили sink — отрепортим правду
-				applyUserVolume(fromVisual(int(math.Round(e.Float("volume") * VOLUME_VISUAL_MAX))))
+				log.Printf("vol: LVA media_player_set_volume")
+				applyUserVolume("LVA", fromVisual(int(math.Round(e.Float("volume")*VOLUME_VISUAL_MAX))))
 
 			case "media_player_play":
 				// HA запустил медиа: очередь mpd заменяется URL из команды
