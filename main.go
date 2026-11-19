@@ -635,7 +635,7 @@ const DUCK_PCT = 50
 // duckState — состояние duck. userPct — пользовательская громкость master
 // (0..VOLUME_MAX_PCT, -1 = не узнали): при duck в sink уходит ×DUCK_PCT/100,
 // при unduck — полная. Мьютекс: пишут и главный цикл (LVA-события), и
-// volapi-горутина (DLNA-громкость) через setSinkPct.
+// mpdproxy-горутина (DLNA-громкость) через setSinkPct.
 var duckState = struct {
 	sync.Mutex
 	ducked  bool
