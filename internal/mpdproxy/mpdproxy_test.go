@@ -4,32 +4,36 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"testing"
 	"time"
 )
 
-// fakeBackend — минимальный mpd: баннер, status, эхо-OK. statusVolume:
-// "" = строка volume НЕ отдаётся (mpd 0.24 при mixer none), "-1" = стиль
-// mpd 0.23, прочее — конкретное значение (для теста переписи).
+// fakeBackend — минимальный mpd. statusVolume: "" = строка volume НЕ
+// отдаётся (mpd 0.24 при mixer none), "-1" = стиль mpd 0.23.
+// idleMode: "event" — каждый idle сразу завершается changed: player;
+// "hold" — idle висит без ответа, noidle завершает его пустым OK
+// (как реальный mpd при отсутствии событий).
 type fakeBackend struct {
 	ln           net.Listener
 	statusVolume string
 	banner       string
+	idleMode     string
 }
 
 func newFakeBackend(t *testing.T) *fakeBackend {
-	return newFakeBackendV(t, "") // по умолчанию — поведение mpd 0.24 на плате
+	return newFakeBackendEx(t, "", "event")
 }
 
-func newFakeBackendV(t *testing.T, statusVolume string) *fakeBackend {
+func newFakeBackendEx(t *testing.T, statusVolume, idleMode string) *fakeBackend {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb := &fakeBackend{ln: ln, statusVolume: statusVolume, banner: "OK MPD 0.24.0\n"}
+	fb := &fakeBackend{ln: ln, statusVolume: statusVolume, banner: "OK MPD 0.24.0\n", idleMode: idleMode}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -44,6 +48,7 @@ func newFakeBackendV(t *testing.T, statusVolume string) *fakeBackend {
 }
 
 func (fb *fakeBackend) serve(c net.Conn) {
+	log.Printf("fake: принял соединение от %v", c.RemoteAddr())
 	defer c.Close()
 	fmt.Fprint(c, fb.banner)
 	br := bufio.NewReader(c)
@@ -53,12 +58,23 @@ func (fb *fakeBackend) serve(c net.Conn) {
 			return
 		}
 		cmd := strings.TrimSpace(line)
+		log.Printf("fake: получил %q", cmd)
 		switch {
 		case cmd == "status":
 			if fb.statusVolume != "" {
 				fmt.Fprintf(c, "volume: %s\n", fb.statusVolume)
 			}
 			fmt.Fprint(c, "repeat: 0\nstate: play\nOK\n")
+		case strings.HasPrefix(cmd, "idle"):
+			if fb.idleMode == "hold" {
+				// idle висит без ответа; noidle завершает пустым OK
+				continue
+			}
+			fmt.Fprint(c, "changed: player\nOK\n")
+		case cmd == "noidle":
+			fmt.Fprint(c, "OK\n")
+		case cmd == "ping":
+			fmt.Fprint(c, "OK\n")
 		default:
 			fmt.Fprint(c, "OK\n")
 		}
@@ -73,7 +89,7 @@ func dialProxy(t *testing.T, addr string) (*bufio.Reader, net.Conn) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	c.SetDeadline(time.Now().Add(3 * time.Second))
+	c.SetDeadline(time.Now().Add(5 * time.Second))
 	br := bufio.NewReader(c)
 	greeting, err := br.ReadString('\n')
 	if err != nil || greeting != "OK MPD 0.24.0\n" {
@@ -89,20 +105,23 @@ func send(t *testing.T, c net.Conn, cmd string) {
 	}
 }
 
-// readResp — читает ответ до OK/ACK.
-func readResp(t *testing.T, br *bufio.Reader) []string {
-	t.Helper()
-	var lines []string
+// resp — читает ответ до OK/ACK.
+func resp(br *bufio.Reader) []string {
+	var out []string
 	for {
 		l, err := br.ReadString('\n')
 		if err != nil {
-			t.Fatalf("чтение ответа: %v (прочитано %q)", err, lines)
+			return append(out, "ERR:"+err.Error())
 		}
-		lines = append(lines, l)
+		out = append(out, l)
 		if l == "OK\n" || strings.HasPrefix(l, "ACK ") {
-			return lines
+			return out
 		}
 	}
+}
+
+func linesEqual(got []string, want ...string) bool {
+	return strings.Join(got, "") == strings.Join(want, "")
 }
 
 // volrec — громкость с записью Set (для проверок перехвата).
@@ -121,6 +140,7 @@ func (v *volrec) volume() Volume {
 func startProxy(t *testing.T, backend string, vol Volume) *Proxy {
 	t.Helper()
 	p := New("127.0.0.1:0", backend, vol)
+	debug.Store(true) // тестам: весь трафик в stderr
 	go p.Serve(context.Background())
 	deadline := time.Now().Add(2 * time.Second)
 	for p.Addr() == "" {
@@ -139,7 +159,7 @@ func TestSetvolIntercepted(t *testing.T) {
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, "setvol 55")
-	if got := readResp(t, br); len(got) != 1 || got[0] != "OK\n" {
+	if got := resp(br); !linesEqual(got, "OK\n") {
 		t.Fatalf("setvol: %q", got)
 	}
 	if len(v.sets) != 1 || v.sets[0] != 55 {
@@ -154,14 +174,14 @@ func TestSetvolClamp(t *testing.T) {
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, "setvol 130")
-	if got := readResp(t, br); len(got) != 1 || got[0] != "OK\n" {
+	if got := resp(br); !linesEqual(got, "OK\n") {
 		t.Fatalf("setvol 130: %q", got)
 	}
 	if len(v.sets) != 1 || v.sets[0] != 100 {
 		t.Fatalf("кламп: %v", v.sets)
 	}
 	send(t, c, "setvol -3")
-	if got := readResp(t, br); len(got) != 1 || !strings.HasPrefix(got[0], "ACK ") {
+	if got := resp(br); len(got) != 1 || !strings.HasPrefix(got[0], "ACK ") {
 		t.Fatalf("setvol -3 должен дать ACK: %q", got)
 	}
 }
@@ -174,116 +194,16 @@ func TestSetvolQuoted(t *testing.T) {
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, `setvol "85"`)
-	if got := readResp(t, br); len(got) != 1 || got[0] != "OK\n" {
+	if got := resp(br); !linesEqual(got, "OK\n") {
 		t.Fatalf("setvol quoted: %q", got)
 	}
 	if len(v.sets) != 1 || v.sets[0] != 85 {
 		t.Fatalf("Set: %v", v.sets)
 	}
 	send(t, c, `volume "+5"`)
-	readResp(t, br)
+	resp(br)
 	if v.cur != 90 {
 		t.Fatalf("volume quoted relative: cur=%d", v.cur)
-	}
-}
-
-func TestTapDeliversPlayerEvents(t *testing.T) {
-	// фейковый бэкенд отвечает на idle событием player — прокси должен
-	// раздасть его ожидающему клиенту (раньше player-события терялись:
-	// контроллер залипал в «PLAYING» после stop)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				fmt.Fprint(c, "OK MPD 0.24.0\n")
-				br := bufio.NewReader(c)
-				for {
-					line, err := br.ReadString('\n')
-					if err != nil {
-						return
-					}
-					cmd := strings.TrimSpace(line)
-					switch {
-					case cmd == "ping":
-						fmt.Fprint(c, "OK\n")
-					case strings.HasPrefix(cmd, "idle"):
-						// каждый idle завершается событием — как в реальном
-						// mpd при постоянных изменениях состояния
-						fmt.Fprint(c, "changed: player\nOK\n")
-					default:
-						fmt.Fprint(c, "OK\n")
-					}
-				}
-			}(c)
-		}
-	}()
-	v := (&volrec{cur: 50}).volume()
-	p := startProxy(t, ln.Addr().String(), v)
-	br, c := dialProxy(t, p.Addr())
-
-	send(t, c, "idle player")
-	// tap-событие может прийти мгновенно и снять idle до нашей проверки —
-	// просто читаем ответ (дедлайн коннекта 3 с из dialProxy)
-	got := readResp(t, br)
-	if len(got) != 2 || got[0] != "changed: player\n" || got[1] != "OK\n" {
-		t.Fatalf("tap player event: %q", got)
-	}
-}
-
-func TestPendingFlushOnIdleRegistration(t *testing.T) {
-	// событие mpd приходит, когда ни один клиент не в idle (окно
-	// обработки upmpdcli) — не теряется, а выдаётся при регистрации idle
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				fmt.Fprint(c, "OK MPD 0.24.0\n")
-				br := bufio.NewReader(c)
-				for {
-					line, err := br.ReadString('\n')
-					if err != nil {
-						return
-					}
-					cmd := strings.TrimSpace(line)
-					if cmd == "ping" {
-						fmt.Fprint(c, "OK\n")
-					} else if strings.HasPrefix(cmd, "idle") {
-						fmt.Fprint(c, "changed: player\nOK\n")
-					} else {
-						fmt.Fprint(c, "OK\n")
-					}
-				}
-			}(c)
-		}
-	}()
-	v := (&volrec{cur: 50}).volume()
-	p := startProxy(t, ln.Addr().String(), v)
-	// tap успевает потребить событие до появления клиента
-	time.Sleep(300 * time.Millisecond)
-
-	br, c := dialProxy(t, p.Addr())
-	send(t, c, "idle player")
-	got := readResp(t, br)
-	if len(got) != 2 || got[0] != "changed: player\n" || got[1] != "OK\n" {
-		t.Fatalf("pending flush: %q", got)
 	}
 }
 
@@ -294,26 +214,26 @@ func TestVolumeRelative(t *testing.T) {
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, "volume +10")
-	readResp(t, br)
+	resp(br)
 	if v.cur != 60 {
 		t.Fatalf("volume +10: cur=%d", v.cur)
 	}
 	send(t, c, "volume -70")
-	readResp(t, br)
+	resp(br)
 	if v.cur != 0 {
 		t.Fatalf("volume -70 (кламп пола): cur=%d", v.cur)
 	}
 }
 
-func TestStatusRewritesVolume(t *testing.T) {
+func TestStatusInsertsVolume(t *testing.T) {
 	// mpd 0.24 на плате: строки volume НЕТ — прокси вставляет её первой
-	fb := newFakeBackend(t) // statusVolume=""
+	fb := newFakeBackend(t)
 	v := &volrec{cur: 77}
 	p := startProxy(t, fb.ln.Addr().String(), v.volume())
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, "status")
-	got := readResp(t, br)
+	got := resp(br)
 	want := []string{"volume: 77\n", "repeat: 0\n", "state: play\n", "OK\n"}
 	if strings.Join(got, "") != strings.Join(want, "") {
 		t.Fatalf("status: %q, хотим %q", got, want)
@@ -322,73 +242,16 @@ func TestStatusRewritesVolume(t *testing.T) {
 
 func TestStatusRewritesLegacyVolumeLine(t *testing.T) {
 	// mpd 0.23-стиль: «volume: -1» переписывается на месте
-	fb := newFakeBackendV(t, "-1")
+	fb := newFakeBackendEx(t, "-1", "event")
 	v := &volrec{cur: 77}
 	p := startProxy(t, fb.ln.Addr().String(), v.volume())
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, "status")
-	got := readResp(t, br)
+	got := resp(br)
 	want := []string{"volume: 77\n", "repeat: 0\n", "state: play\n", "OK\n"}
 	if strings.Join(got, "") != strings.Join(want, "") {
 		t.Fatalf("status: %q, хотим %q", got, want)
-	}
-}
-
-func TestIdleNotify(t *testing.T) {
-	fb := newFakeBackend(t)
-	v := &volrec{cur: 50}
-	p := startProxy(t, fb.ln.Addr().String(), v.volume())
-	br, c := dialProxy(t, p.Addr())
-
-	send(t, c, "idle mixer player")
-	// idle регистрируется в dispatch-горутине — дождаться, иначе
-	// нотификация уйдёт в пустоту
-	deadline := time.Now().Add(2 * time.Second)
-	for p.idleCount() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("idle не зарегистрирован")
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	// громкость меняется → соединение получает changed: mixer
-	p.NotifyVolume()
-	got := readResp(t, br)
-	if len(got) != 2 || got[0] != "changed: mixer\n" || got[1] != "OK\n" {
-		t.Fatalf("idle notify: %q", got)
-	}
-}
-
-func TestIdleFilterMismatchKeepsHolding(t *testing.T) {
-	fb := newFakeBackend(t)
-	v := &volrec{cur: 50}
-	p := startProxy(t, fb.ln.Addr().String(), v.volume())
-	br, c := dialProxy(t, p.Addr())
-
-	send(t, c, "idle player") // mixer не запрошен
-	p.NotifyVolume()
-	// ответа быть не должно: соединение продолжает висеть в idle.
-	// noidle завершает ожидание пустым OK.
-	send(t, c, "noidle")
-	got := readResp(t, br)
-	if len(got) != 1 || got[0] != "OK\n" {
-		t.Fatalf("noidle: %q", got)
-	}
-}
-
-func TestIdleThenCommandCancelsIdle(t *testing.T) {
-	fb := newFakeBackend(t)
-	v := &volrec{cur: 50}
-	p := startProxy(t, fb.ln.Addr().String(), v.volume())
-	br, c := dialProxy(t, p.Addr())
-
-	send(t, c, "idle")
-	// команда на idle-соединении: idle снимается молча, приходит только
-	// ответ команды (семантика mpd)
-	send(t, c, "status")
-	got := readResp(t, br)
-	if !strings.HasPrefix(got[0], "volume:") {
-		t.Fatalf("status после отмены idle: %q", got)
 	}
 }
 
@@ -399,14 +262,98 @@ func TestPassthrough(t *testing.T) {
 	br, c := dialProxy(t, p.Addr())
 
 	send(t, c, "ping")
-	if got := readResp(t, br); len(got) != 1 || got[0] != "OK\n" {
+	if got := resp(br); !linesEqual(got, "OK\n") {
 		t.Fatalf("ping: %q", got)
 	}
 	// после pass-through перехват продолжает работать
 	send(t, c, "setvol 20")
-	readResp(t, br)
+	resp(br)
 	if len(v.sets) != 1 || v.sets[0] != 20 {
 		t.Fatalf("setvol после pass-through: %v", v.sets)
+	}
+}
+
+// idleForwardedWait — дождаться, пока соединение клиента уйдёт в
+// форварднутый idle.
+func idleForwardedWait(t *testing.T, p *Proxy) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for p.idleCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("idle не зарегистрирован")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestIdleForwarded(t *testing.T) {
+	// transparent: idle клиента форвардится бэкенду; бэкенд отвечает
+	// событием — оно доезжает до клиента через ридер
+	fb := newFakeBackend(t)
+	v := &volrec{cur: 50}
+	p := startProxy(t, fb.ln.Addr().String(), v.volume())
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, "idle playlist player mixer options")
+	idleForwardedWait(t, p)
+	got := resp(br)
+	if !linesEqual(got, "changed: player\n", "OK\n") {
+		t.Fatalf("idle forwarding: %q", got)
+	}
+}
+
+func TestMixerInject(t *testing.T) {
+	// idle с hold-бэкендом (нет mpd-событий): NotifyVolume шлёт noidle,
+	// к пустому ответу добавляется changed: mixer
+	fb := newFakeBackendEx(t, "", "hold")
+	v := &volrec{cur: 50}
+	p := startProxy(t, fb.ln.Addr().String(), v.volume())
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, "idle mixer player")
+	idleForwardedWait(t, p)
+	p.NotifyVolume()
+	got := resp(br)
+	if !linesEqual(got, "changed: mixer\n", "OK\n") {
+		t.Fatalf("mixer inject: %q", got)
+	}
+}
+
+func TestMixerInjectSkippedWithoutMixerMask(t *testing.T) {
+	// клиент не запрашивал mixer — инжект не должен доставлять
+	// неожиданный changed: mixer
+	fb := newFakeBackendEx(t, "", "hold")
+	v := &volrec{cur: 50}
+	p := startProxy(t, fb.ln.Addr().String(), v.volume())
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, "idle player")
+	idleForwardedWait(t, p)
+	p.NotifyVolume()
+	// инжекта быть не должно; noidle от клиента завершает ожидание —
+	// бэкенд (hold) отвечает пустым OK, который форвардится клиенту
+	send(t, c, "noidle")
+	got := resp(br)
+	if !linesEqual(got, "OK\n") {
+		t.Fatalf("noidle без инжекта: %q", got)
+	}
+}
+
+func TestCommandAfterIdleForwarded(t *testing.T) {
+	// команда после форварднутого idle доходит до бэкенда и ответ
+	// возвращается клиенту (hold-бэкенд игнорирует idle и отвечает
+	// только на реальные команды)
+	fb := newFakeBackendEx(t, "", "hold")
+	v := &volrec{cur: 50}
+	p := startProxy(t, fb.ln.Addr().String(), v.volume())
+	br, c := dialProxy(t, p.Addr())
+
+	send(t, c, "idle mixer player")
+	idleForwardedWait(t, p)
+	send(t, c, "status")
+	got := resp(br)
+	if !strings.HasPrefix(got[0], "volume:") {
+		t.Fatalf("status после idle: %q", got)
 	}
 }
 

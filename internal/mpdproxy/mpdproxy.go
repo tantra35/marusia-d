@@ -1,38 +1,30 @@
 // Package mpdproxy — MPD-протокольный прокси между upmpdcli и реальным mpd.
 //
-// Схема (2026-11-19, замена upmpdcli-volhook/volapi):
+// Схема (2026-11-19, прозрачная пересылка idle; замена upmpdcli-volhook/volapi):
 //
 //	upmpdcli ──(MPD-протокол)──> marusia-d :6600 ──прокси──> mpd :6601
 //	                                │
-//	                                └─ перехват setvol/volume/status/idle
+//	                                └─ перехват setvol/volume/status
+//	                                   + mixer-инжект через noidle
 //
 // Реальный mpd слушает 127.0.0.1:6601 (mixer_type none — громкость mpd не
-// регулирует). Прокси перехватывает ровно четыре вещи, всё остальное —
-// прозрачный построчный форвард с сохранением границ ответа (OK/ACK):
+// регулирует). Архитектура — ЧЕСТНЫЙ ПРОКСИ: idle клиента форвардится в
+// mpd как есть, mpd сам держит соединение в idle, буферизует свой поток
+// событий и ничего не теряет; каждое подключение получает свою горутину-
+// ридер бэкенда. Прокси перехватывает ровно три вещи:
 //
 //	setvol N / volume ±N → громкость sink через коллбэк Volume.Set
-//	                       (upmpdcli шлёт mute как setvol 0), ответ OK;
-//	status               → форвард ответа mpd с переписыванием строки
-//	                       «volume: -1» (при mixer none) на реальную
-//	                       визуальную громкость — без этого upmpdcli
-//	                       раздаёт контроллерам мусор;
-//	idle [subs...]       → соединение переводится в ожидание; события
-//	                       раздаются через tap (см. ниже): реальные
-//	                       player/queue/options события mpd + синтетический
-//	                       «changed: mixer» при смене громкости (NotifyVolume)
-//	                       — штатный путь, которым upmpdcli публикует
-//	                       состояние в RenderingControl/AVTransport.
+//	                       (upmpdcli шлёт mute как setvol 0); ответ OK;
+//	status               → форвард ответа mpd со вставкой/переписыванием
+//	                       строки «volume: N» (mpd 0.24 при mixer none
+//	                       строки не отдаёт вовсе);
+//	mixer-инжект         → при смене громкости (NotifyVolume) в
+//	                       форварднутый idle бэкенду шлётся noidle,
+//	                       к ответу добавляется «changed: mixer»
+//	                       (стандартный трюк mixer-демона).
 //
-// Tap: прокси держит собственное idle-подключение к mpd и раздаёт реальные
-// события ожидающим клиентам по их фильтрам. Без tap клиент застревал бы в
-// устаревшем состоянии: mpd-события stop/конец-трека/смена-очереди до него
-// не доходили бы никогда.
-//
-// Стейт-машина пер-соединение: «кто в idle» — атрибут коннекта (mpd-клиенты
-// многосоединённые, upmpdcli держит командное и idle-соединение отдельно).
-// Команда на idle-соединении (кроме noidle) молча снимает idle — как в mpd.
-// idle-соединения: ping-keepalive снесён 2026-11-19 — молчащий бэкенд mpd закрывает
-// по connection_timeout; прокси тогда честно закрывает клиента, тот переподключается.
+// Жизненный цикл честный: mpd закрыл бэкенд → прокси закрывает и
+// клиентское соединение (клиент переподключается сам).
 package mpdproxy
 
 import (
@@ -50,20 +42,6 @@ import (
 	"time"
 )
 
-// Volume — мост громкости в демон. Get — текущая ВИЗУАЛЬНАЯ громкость
-// 0..100 (-1 = не узнали); Set — применить визуальные 0..100 (sink,
-// отклик, репорт LVA — внутри реализации).
-type Volume struct {
-	Get func() int
-	Set func(v int)
-}
-
-// idleMask — маска tap-подписки на события mpd: объединение того, что
-// запрашивают клиенты (у upmpdcli — playlist player mixer options,
-// mpdcli.cxx:199-203). События вне фильтра конкретного клиента
-// отсеиваются при раздаче.
-const idleMask = "playlist player mixer options"
-
 // debug — дамп всего трафика в stderr (env MARUSIA_MPDPROXY_DEBUG=1).
 // Для живой отладки: демон пускается руками из /tmp, stdout смотрит ssh.
 var debug atomic.Bool
@@ -74,6 +52,14 @@ func pdebug(id int, format string, args ...any) {
 	}
 }
 
+// Volume — мост громкости в демон. Get — текущая ВИЗУАЛЬНАЯ громкость
+// 0..100 (-1 = не узнали); Set — применить визуальные 0..100 (sink,
+// отклик, репорт LVA — внутри реализации).
+type Volume struct {
+	Get func() int
+	Set func(v int)
+}
+
 // Proxy — слушатель MPD-протокола. NotifyVolume безопасен на nil
 // (прокси может быть выключен флагом).
 type Proxy struct {
@@ -81,20 +67,15 @@ type Proxy struct {
 	backend string // реальный mpd (127.0.0.1:6601)
 	vol     Volume
 
-	mu    sync.Mutex
-	conns map[*pconn]struct{}
-	ln    net.Listener
-	// pending — события, для которых не нашлось ни одного idle-клиента
-	// (клиенты выходят из idle на обработку и возвращаются не мгновенно):
-	// выдаются сразу при следующей регистрации idle — семантика буфера
-	// самого mpd, без них клиент терял бы события в окне обработки
-	nextID  int32
-	pending map[string]bool
+	mu     sync.Mutex
+	conns  map[*pconn]struct{}
+	ln     net.Listener
+	nextID int32
 }
 
 // New — создать прокси; запуск — Serve.
 func New(addr, backend string, vol Volume) *Proxy {
-	return &Proxy{addr: addr, backend: backend, vol: vol, conns: make(map[*pconn]struct{}), pending: make(map[string]bool)}
+	return &Proxy{addr: addr, backend: backend, vol: vol, conns: make(map[*pconn]struct{})}
 }
 
 // Addr — фактический адрес слушателя (пусто до старта Serve).
@@ -132,7 +113,6 @@ func (p *Proxy) Serve(ctx context.Context) {
 		}
 	}()
 	log.Printf("mpdproxy: слушаю %s → %s", p.addr, p.backend)
-	go p.tapLoop(ctx)
 	for {
 		cli, err := ln.Accept()
 		if err != nil {
@@ -146,58 +126,37 @@ func (p *Proxy) Serve(ctx context.Context) {
 	}
 }
 
-// NotifyVolume — громкость изменилась (любой источник): все соединения,
-// сидящие в idle с интересом к mixer, получают «changed: mixer»; если
-// idle-клиентов нет — событие копится в pending и уйдёт при следующей
-// регистрации idle.
+// NotifyVolume — громкость изменилась (любой источник): инжект
+// «changed: mixer» во все соединения, находящиеся в форварднутом idle.
 func (p *Proxy) NotifyVolume() {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	delivered := false
+	conns := make([]*pconn, 0, len(p.conns))
 	for c := range p.conns {
-		if c.notifySubsystem("mixer") {
-			delivered = true
-		}
+		conns = append(conns, c)
 	}
-	if !delivered {
-		p.pending["mixer"] = true
-	} else {
-		delete(p.pending, "mixer")
+	p.mu.Unlock()
+	for _, c := range conns {
+		c.injectMixer()
 	}
 }
 
-// idleCount — соединений в состоянии idle (тестам: дождаться регистрации).
+// idleCount — соединений в форварднутом idle (тестам).
 func (p *Proxy) idleCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := 0
 	for c := range p.conns {
-		c.mu.Lock()
-		if c.idle {
+		if c.idleForwarded.Load() {
 			n++
 		}
-		c.mu.Unlock()
 	}
 	return n
 }
 
-// pendingSnapshot — копия набора непри delivered-событий (для логов).
-func (p *Proxy) pendingSnapshot() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make([]string, 0, len(p.pending))
-	for sub := range p.pending {
-		out = append(out, sub)
-	}
-	return out
-}
-
-// handle — жизнь одного клиентского соединения: баннер от mpd, затем
-// построчный разбор команд. Любая ошибка любой стороны — рвём оба
-// (клиент переподключится сам).
+// handle — жизнь одного клиентского соединения.
 func (p *Proxy) handle(cli net.Conn) {
 	id := int(atomic.AddInt32(&p.nextID, 1))
 	be, err := net.Dial("tcp", p.backend)
@@ -220,24 +179,27 @@ func (p *Proxy) handle(cli net.Conn) {
 	p.conns[c] = struct{}{}
 	p.mu.Unlock()
 	pdebug(id, "open %s", cli.RemoteAddr())
+	log.Printf("mpdproxy[%d] бэкенд-коннект: local=%v remote=%v", id, be.LocalAddr(), be.RemoteAddr())
 
 	defer func() {
 		pdebug(id, "close")
 		c.shutdown()
 	}()
 
-	// приветствие mpd форвардим как есть — на версии могут сидеть
-	// проверки совместимости клиентов
-	c.bmu.Lock()
-	greeting, err := c.ber.ReadString('\n')
-	c.bmu.Unlock()
-	if err != nil {
+	// приветствие mpd форвардим как есть — на версии сидят проверки
+	// совместимости клиентов
+	greeting, gerr := c.ber.ReadString('\n')
+	if gerr != nil {
 		return
 	}
 	if _, err := c.clw.WriteString(greeting); err != nil {
 		return
 	}
 	c.clw.Flush()
+
+	// ридер бэкенда — единственный читатель ber: пересылает ответы mpd
+	// клиенту, кроме перехваченных (catch)
+	go c.backendReader()
 
 	for {
 		line, err := c.clr.ReadString('\n')
@@ -255,19 +217,90 @@ type pconn struct {
 	p   *Proxy
 	id  int
 	cli net.Conn
-	clr *bufio.Reader // читает клиентские команды (только dispatch-горутина)
-	clw *bufio.Writer // пишет клиенту (wmu)
+	clr *bufio.Reader // клиентские команды (dispatch-горутина)
+	clw *bufio.Writer // клиенту (wmu)
 	be  net.Conn
-	ber *bufio.Reader // читает ответы mpd (bmu)
-	bew *bufio.Writer // пишет mpd (bmu)
+	ber *bufio.Reader // ответы mpd (только backendReader)
+	bew *bufio.Writer // к mpd (bmu)
 
-	wmu sync.Mutex // сериализация записей клиенту (ответы + idle-нотификации)
-	bmu sync.Mutex // сериализация пар «команда→ответ» к mpd (ping ходит параллельно)
+	wmu sync.Mutex // сериализация записей клиенту (ответы + инжекты)
+	bmu sync.Mutex // сериализация записей к mpd (dispatch + инжект noidle)
 
-	mu          sync.Mutex
-	idle        bool            // клиент сидит в idle (ждёт changed:...)
-	idleFilter  map[string]bool // nil = все подсистемы
-	shutdownOne sync.Once
+	// catch — перехват СЛЕДУЮЩЕГО ответа бэкенда (dispatch или инжект
+	// пишет сюда канал до отправки команды; ридер отдаёт строки в канал
+	// вместо клиента)
+	catchMu sync.Mutex
+	catch   chan []string
+
+	idleForwarded atomic.Bool  // бэкенд сидит в нашем форварднутом idle
+	idleSubs      atomic.Value // маска последнего idle (string; "" = все)
+	injectMu      sync.Mutex   // один инжект mixer на соединение
+	shutdownOne   sync.Once
+}
+
+// registerCatch — зарегистрировать перехват следующего ответа бэкенда.
+// Протокол mpd последовательный: незакрытый перехват может быть только
+// один, поэтому при занятости отказываем (вызывающий не должен слать
+// вторую команду поверх).
+func (c *pconn) registerCatch(ch chan []string) bool {
+	c.catchMu.Lock()
+	defer c.catchMu.Unlock()
+	if c.catch != nil {
+		return false // уже ждут другой ответ
+	}
+	c.catch = ch
+	return true
+}
+
+// takeCatch — забрать зарегистрированный перехват (nil если нет).
+func (c *pconn) takeCatch() chan []string {
+	c.catchMu.Lock()
+	defer c.catchMu.Unlock()
+	ch := c.catch
+	c.catch = nil
+	return ch
+}
+
+// backendReader — единственный читатель ber: пересылает ответы mpd
+// клиенту, кроме перехваченных (catch). Живёт, пока соединение не закрыто
+// (shutdown закрывает be — ридер разблокируется и выходит).
+func (c *pconn) backendReader() {
+	for {
+		var lines []string
+		for {
+			l, err := c.ber.ReadString('\n')
+			if err != nil {
+				pdebug(c.id, "reader: конец потока бэкенда (%v)", err)
+				c.shutdown()
+				return
+			}
+			if strings.HasPrefix(l, "binary: ") {
+				n, perr := strconv.Atoi(strings.TrimSpace(l[len("binary: "):]))
+				if perr != nil {
+					pdebug(c.id, "reader: binary parse: %v", perr)
+					c.shutdown()
+					return
+				}
+				buf := make([]byte, n+1) // payload + '\n'
+				if _, err := io.ReadFull(c.ber, buf); err != nil {
+					c.shutdown()
+					return
+				}
+				lines = append(lines, l, string(buf))
+				continue
+			}
+			lines = append(lines, l)
+			if l == "OK\n" || strings.HasPrefix(l, "ACK ") {
+				break
+			}
+		}
+		// перехват? (dispatch/инжект ждут именно этот ответ)
+		if ch := c.takeCatch(); ch != nil {
+			ch <- lines
+			continue
+		}
+		c.writeLines(lines...)
+	}
 }
 
 // dispatch — одна команда клиента. false = закрыть соединение.
@@ -277,22 +310,16 @@ func (c *pconn) dispatch(line string) bool {
 		return true
 	}
 	cmd := strings.ToLower(fields[0])
-	// Любая команда кроме noidle на idle-соединении молча снимает idle
-	// (семантика mpd: ответ idle теряется, идёт ответ команды).
-	c.mu.Lock()
-	wasIdle := c.idle
-	if c.idle && cmd != "noidle" {
-		c.idle = false
-		pdebug(c.id, "idle отменён командой %q", cmd)
-	}
-	c.mu.Unlock()
-	pdebug(c.id, "cmd %q (idle был: %v)", line, wasIdle)
+	pdebug(c.id, "cmd %q (idle-forwarded: %v)", line, c.idleForwarded.Load())
 
 	switch cmd {
 	case "setvol":
 		// libmpdclient цитирует аргумент: на проводе «setvol "85"»
 		// (mpd-парсер кавычки легально снимает; у нас было источником
 		// ACK-ошибки, отравлявшей соединение upmpdcli)
+		if len(fields) < 2 {
+			return c.ack(cmd, "нужен аргумент 0..100")
+		}
 		n, err := strconv.Atoi(strings.Trim(fields[1], `"`))
 		if err != nil || n < 0 {
 			return c.ack(cmd, "некорректная громкость "+fields[1])
@@ -302,10 +329,11 @@ func (c *pconn) dispatch(line string) bool {
 		}
 		c.p.vol.Set(n)
 		c.writeLines("OK\n")
+
 	case "volume":
-		// deprecated-команда относительной громкости: «+10»/«-10»/«55»
-		// (возможно в кавычках — см. setvol). Не перехватывать нельзя —
-		// mixer none у mpd ответил бы ACK.
+		// deprecated-команда относительной громкости (в кавычках —
+		// см. setvol). Не перехватывать нельзя — mixer none у mpd
+		// ответил бы ACK.
 		if len(fields) < 2 {
 			return c.ack(cmd, "нужен аргумент")
 		}
@@ -344,249 +372,105 @@ func (c *pconn) dispatch(line string) bool {
 		}
 		c.p.vol.Set(v)
 		c.writeLines("OK\n")
-	case "idle":
-		// Не блокируем чтение: idle «висит» просто потому, что мы не
-		// отвечаем, — до NotifyVolume/noidle/чужой команды. Регистрация
-		// и выдача накопленных событий — атомарно под p.mu, иначе
-		// событие могло бы прийти между регистрацией и выдачей.
-		c.p.mu.Lock()
-		c.mu.Lock()
-		c.idle = true
-		if len(fields) > 1 {
-			c.idleFilter = make(map[string]bool, len(fields)-1)
-			for _, sub := range fields[1:] {
-				c.idleFilter[sub] = true
-			}
-		} else {
-			c.idleFilter = nil
-		}
-		var flush []string
-		for sub := range c.p.pending {
-			if c.idleFilter == nil || c.idleFilter[sub] {
-				flush = append(flush, sub)
-			}
-		}
-		for _, sub := range flush {
-			delete(c.p.pending, sub)
-		}
-		if len(flush) > 0 {
-			c.idle = false
-		}
-		c.mu.Unlock()
-		c.p.mu.Unlock()
-		pdebug(c.id, "idle ждёт, фильтр %v, flush %v", fields[1:], flush)
-		if len(flush) > 0 {
-			lines := make([]string, 0, len(flush)+1)
-			for _, sub := range flush {
-				lines = append(lines, "changed: "+sub+"\n")
-			}
-			lines = append(lines, "OK\n")
-			c.writeLines(lines...)
-		}
-	case "noidle":
-		// отмена ожидающего idle — пустой OK (иначе eventloop клиента висит)
-		c.mu.Lock()
-		c.idle = false
-		c.mu.Unlock()
-		c.writeLines("OK\n")
+
 	case "status":
-		lines, err := c.backendExchange(line)
-		if err != nil {
+		// форвард с перехватом ответа: mixer none у mpd 0.24 — строки
+		// volume нет вовсе (0.23 отдавал «volume: -1»); вставляем/переписываем
+		// на реальную визуальную громкость — без этого upmpdcli не видит
+		// громкости и контроллерам раздаётся пустота
+		ch := make(chan []string) // небуферизованный
+		if !c.registerCatch(ch) {
+			// занято (не должно случаться при последовательном mpd):
+			// шлём без перехвата — сырой ответ вернёт ридер
+			pdebug(c.id, "status: catch занят — форвард без вставки volume")
+			if err := c.backendWrite(line); err != nil {
+				return false
+			}
+			return true
+		}
+		if err := c.backendWrite(line); err != nil {
+			c.registerCatch(nil)
 			return false
 		}
-		// mixer none: mpd 0.23 отдавал «volume: -1», 0.24 строку ВООБЩЕ
-		// опускает. Переписываем найденную, при отсутствии — вставляем
-		// первой (volume — первая строка статуса mpd): без неё upmpdcli
-		// не видит громкости и контроллерам раздаётся пустота
-		if v := c.p.vol.Get(); v >= 0 {
-			inserted := false
-			for i, l := range lines {
-				if strings.HasPrefix(l, "volume:") {
-					lines[i] = fmt.Sprintf("volume: %d\n", v)
-					inserted = true
-					break
+		select {
+		case lines := <-ch:
+			if v := c.p.vol.Get(); v >= 0 {
+				inserted := false
+				for i, l := range lines {
+					if strings.HasPrefix(l, "volume:") {
+						lines[i] = fmt.Sprintf("volume: %d\n", v)
+						inserted = true
+						break
+					}
+				}
+				if !inserted {
+					lines = append([]string{fmt.Sprintf("volume: %d\n", v)}, lines...)
+				}
+				pdebug(c.id, "status volume → %d", v)
+			}
+			c.writeLines(lines...)
+		case <-time.After(10 * time.Second):
+			// владелец сдался: запоздавший ответ уходит клиенту
+			// (синхрон потока), затем соединение закрываем
+			pdebug(c.id, "status: таймаут ответа бэкенда")
+			if ch := c.takeCatch(); ch != nil {
+				select {
+				case lines := <-ch:
+					c.writeLines(lines...)
+				default:
 				}
 			}
-			if !inserted {
-				lines = append([]string{fmt.Sprintf("volume: %d\n", v)}, lines...)
-			}
-			pdebug(c.id, "status volume → %d", v)
+			return false
 		}
-		c.writeLines(lines...)
+
+	case "idle":
+		// форвард в mpd КАК ЕСТЬ: mpd сам держит соединение в idle,
+		// буферизует события (ничего не теряется в окнах обработки) и
+		// exempt от connection_timeout. Ответ (буферизованные события)
+		// уйдёт клиенту через ридер. idleForwarded/idleSubs нужны для
+		// инжекта changed: mixer при смене громкости (инжект — только
+		// если клиент запрашивал mixer).
+		if err := c.backendWrite(line); err != nil {
+			return false
+		}
+		subs := ""
+		if len(fields) > 1 {
+			subs = strings.Join(fields[1:], " ")
+		}
+		c.idleSubs.Store(subs)
+		c.idleForwarded.Store(true)
+
+	case "noidle":
+		// форвард; ответ (буферизованные события или пустой OK) уйдёт
+		// клиенту через ридер
+		if err := c.backendWrite(line); err != nil {
+			return false
+		}
+
 	case "close":
-		c.backendWrite(line) // mpd закрывает соединение без ответа
+		if err := c.backendWrite(line); err != nil {
+			pdebug(c.id, "close: backend write err: %v", err)
+		}
 		return false
+
 	default:
 		// прозрачный форвард; command_list_* тоже летит насквозь —
 		// upmpdcli списков не шлёт, а перехват внутри списка сломал бы
 		// соответствие команды и list_OK
 		if cmd == "command_list_begin" {
-			log.Printf("mpdproxy: command_list от клиента — форвард без перехвата (setvol внутри списка с mixer none даст ACK)")
+			pdebug(c.id, "command_list от клиента — форвард без перехвата")
 		}
-		lines, err := c.backendExchange(line)
-		if err != nil {
+		if err := c.backendWrite(line); err != nil {
 			return false
 		}
-		c.writeLines(lines...)
 	}
 	return true
 }
 
-// notifySubsystem — раздача события (tap или синтетический mixer)
-// ожидающему idle-соединению с совпадающим фильтром. Возвращает true,
-// если событие доставлено. Вызывается под p.mu.
-func (c *pconn) notifySubsystem(sub string) bool {
-	c.mu.Lock()
-	if !c.idle || (c.idleFilter != nil && !c.idleFilter[sub]) {
-		c.mu.Unlock()
-		return false
-	}
-	c.idle = false
-	c.mu.Unlock()
-	pdebug(c.id, "notify changed: %s", sub)
-	c.writeLines("changed: "+sub+"\n", "OK\n")
-	return true
-}
-
-// tapLoop — собственное idle-подключение прокси к mpd: слушает реальные
-// события и раздаёт их локально-ожидающим клиентам. НЕОБХОДИМО: до него
-// прокси перехватывал idle клиентов и подсовывал только синтетический
-// mixer — player/queue/options события mpd (stop, конец трека, смена
-// очереди) до upmpdcli не доходили, и контроллеры залипали в «PLAYING».
-func (p *Proxy) tapLoop(ctx context.Context) {
-tapFor:
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		be, err := net.Dial("tcp", p.backend)
-		if err != nil {
-			log.Printf("mpdproxy tap: dial %s: %v (повтор через 2с)", p.backend, err)
-			sleepCtx2(ctx, 2*time.Second)
-			continue
-		}
-		br := bufio.NewReader(be)
-		bw := bufio.NewWriter(be)
-		// баннер пропустить
-		if _, err := br.ReadString('\n'); err != nil {
-			be.Close()
-			sleepCtx2(ctx, 2*time.Second)
-			continue
-		}
-		log.Printf("mpdproxy tap: слушаю события mpd (%s)", idleMask)
-		armed := true
-		for {
-			if armed {
-				be.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				_, err = bw.WriteString("idle " + idleMask + "\n")
-				if err == nil {
-					err = bw.Flush()
-				}
-				be.SetWriteDeadline(time.Time{})
-				if err != nil {
-					break
-				}
-				armed = false
-			}
-			// читаем ответ idle: строки changed: X … до OK. Дедлайн длинный:
-			// mpd молчит, пока не будет события; короткий дедлайн рвал
-			// соединение каждые 30 с и терял события в окнах реконнекта
-			var subs []string
-			done := false
-			var rerr error
-			for {
-				be.SetReadDeadline(time.Now().Add(120 * time.Second))
-				l, err := br.ReadString('\n')
-				if err != nil {
-					be.SetReadDeadline(time.Time{})
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						// idle молчал (дедлайн) — mpd события не теряем:
-						// перевооружаем idle на том же соединении, БЕЗ
-						// разрыва (разрыв терял события в окне реконнекта)
-						armed = true
-						break
-					}
-					rerr = err
-					goto connDead
-				}
-				be.SetReadDeadline(time.Time{})
-				l = strings.TrimSpace(l)
-				if strings.HasPrefix(l, "changed: ") {
-					subs = append(subs, strings.TrimPrefix(l, "changed: "))
-					continue
-				}
-				if l == "OK" || strings.HasPrefix(l, "ACK ") {
-					done = true
-				}
-				break
-			}
-			armed = true
-			if done && len(subs) > 0 {
-				p.mu.Lock()
-				for _, sub := range subs {
-					delivered := false
-					for c := range p.conns {
-						if c.notifySubsystem(sub) {
-							delivered = true
-						}
-					}
-					// некому доставлять — клиент в окне обработки
-					// предыдущего события: копим до следующего idle
-					if delivered {
-						delete(p.pending, sub)
-					} else {
-						p.pending[sub] = true
-					}
-				}
-				p.mu.Unlock()
-				pdebug(0, "tap события: %v (pending %v)", subs, p.pendingSnapshot())
-			}
-		connDead:
-			be.Close()
-			log.Printf("mpdproxy tap: связь потеряна (err=%v; повтор через 2с)", rerr)
-			rerr = nil
-			sleepCtx2(ctx, 2*time.Second)
-			continue tapFor // иначе застряли бы в armed-цикле на мёртвом br
-		}
-	}
-}
-
-func sleepCtx2(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
-}
-
-// backendExchange — команда к mpd и сбор ответа до OK/ACK. Вызывается
-// только из dispatch-горутины; bmu защищает от параллельного ping.
-func (c *pconn) backendExchange(line string) ([]string, error) {
+// backendWrite — отправка строки к mpd (bmu).
+func (c *pconn) backendWrite(line string) error {
 	c.bmu.Lock()
 	defer c.bmu.Unlock()
-	if err := c.backendWriteLocked(line); err != nil {
-		pdebug(c.id, "backend write err: %v", err)
-		return nil, err
-	}
-	lines, err := c.readResponseLocked()
-	if err != nil {
-		pdebug(c.id, "backend read err: %v", err)
-	} else if debug.Load() {
-		joined := strings.TrimSuffix(strings.Join(lines, ""), "\n")
-		pdebug(c.id, "backend ответ: %q", strings.ReplaceAll(joined, "\n", " | "))
-	}
-	return lines, err
-}
-
-// backendWrite — отправка без чтения ответа (close).
-func (c *pconn) backendWrite(line string) {
-	c.bmu.Lock()
-	c.backendWriteLocked(line)
-	c.bmu.Unlock()
-}
-
-func (c *pconn) backendWriteLocked(line string) error {
 	c.be.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	defer c.be.SetWriteDeadline(time.Time{})
 	if _, err := c.bew.WriteString(line); err != nil {
@@ -596,39 +480,72 @@ func (c *pconn) backendWriteLocked(line string) error {
 		return err
 	}
 	if err := c.bew.Flush(); err != nil {
-		return err
+		log.Printf("mpdproxy[?] ЗАПИСАНО err=%v", err)
 	}
+	log.Printf("mpdproxy[?] ЗАПИСАНО ok: %q", line)
 	return nil
 }
 
-// readResponseLocked — строки ответа mpd до «OK»/«ACK …». Встреченный
-// «binary: N» протаскивает N байт payload + перевод строки как есть
-// (binary-ответы — albumart/readcomments; построчный разбор там сломался бы).
-func (c *pconn) readResponseLocked() ([]string, error) {
-	var lines []string
-	for {
-		c.be.SetReadDeadline(time.Now().Add(10 * time.Second))
-		l, err := c.ber.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		c.be.SetReadDeadline(time.Time{})
-		if strings.HasPrefix(l, "binary: ") {
-			n, perr := strconv.Atoi(strings.TrimSpace(l[len("binary: "):]))
-			if perr != nil {
-				return nil, fmt.Errorf("binary: %v", perr)
+// injectMixer — инжект «changed: mixer» в форварднутый idle: бэкенду
+// шлётся noidle (ответ перехватывается), к ответу добавляется mixer,
+// если его там не было, и всё уходит клиенту.
+func (c *pconn) injectMixer() {
+	if !c.idleForwarded.Load() {
+		return // не в idle — upmpdcli узнает громкость на ближайшем status
+	}
+	// клиент не запрашивал mixer в idle — инжект был бы неожиданным
+	// изменением протокола (upmpdcli запрашивает, но подстраховка)
+	if subs, _ := c.idleSubs.Load().(string); subs != "" && !strings.Contains(" "+subs+" ", " mixer ") {
+		return
+	}
+	c.injectMu.Lock()
+	defer c.injectMu.Unlock()
+	// клиент мог выйти из idle, пока ждали мьютекс
+	if !c.idleForwarded.Load() {
+		return
+	}
+	ch := make(chan []string) // небуферизованный
+	if !c.registerCatch(ch) {
+		return // занято — пропускаем инжект (upmpdcli узнает из status)
+	}
+	if err := c.backendWrite("noidle"); err != nil {
+		c.registerCatch(nil)
+		return
+	}
+	select {
+	case lines := <-ch:
+		hasMixer := false
+		for _, l := range lines {
+			if strings.HasPrefix(l, "changed: mixer") {
+				hasMixer = true
+				break
 			}
-			buf := make([]byte, n+1) // payload + '\n'
-			if _, err := io.ReadFull(c.ber, buf); err != nil {
-				return nil, err
+		}
+		if !hasMixer {
+			// mixer вставляется ПЕРЕД завершающим OK (ответ noidle
+			// обычно — просто "OK"); строки после OK были бы
+			// неожиданными для клиента
+			trimmed := lines[:0]
+			for _, l := range lines {
+				if l != "OK\n" && !strings.HasPrefix(l, "ACK ") {
+					trimmed = append(trimmed, l)
+				}
 			}
-			lines = append(lines, l, string(buf))
-			continue
+			lines = append(trimmed, "changed: mixer\n", "OK\n")
 		}
-		lines = append(lines, l)
-		if l == "OK\n" || strings.HasPrefix(l, "ACK ") {
-			return lines, nil
+		pdebug(c.id, "inject changed: mixer")
+		c.writeLines(lines...)
+		c.idleForwarded.Store(false)
+	case <-time.After(5 * time.Second):
+		// запоздавший ответ уходит клиенту (синхрон), соединение закрываем
+		if ch := c.takeCatch(); ch != nil {
+			select {
+			case lines := <-ch:
+				c.writeLines(lines...)
+			default:
+			}
 		}
+		pdebug(c.id, "inject mixer: таймаут ответа на noidle")
 	}
 }
 
