@@ -31,8 +31,8 @@
 // Стейт-машина пер-соединение: «кто в idle» — атрибут коннекта (mpd-клиенты
 // многосоединённые, upmpdcli держит командное и idle-соединение отдельно).
 // Команда на idle-соединении (кроме noidle) молча снимает idle — как в mpd.
-// Для соединений в idle прокси держит связь с mpd живой периодическим ping
-// (иначе connection_timeout mpd закрыл бы «молчащее» соединение).
+// idle-соединения: ping-keepalive снесён 2026-11-19 — молчащий бэкенд mpd закрывает
+// по connection_timeout; прокси тогда честно закрывает клиента, тот переподключается.
 package mpdproxy
 
 import (
@@ -57,10 +57,6 @@ type Volume struct {
 	Get func() int
 	Set func(v int)
 }
-
-// pingInterval — держак idle-соединений через mpd: connection_timeout mpd
-// (дефолт 30 с) закрывает соединения без команд; ping каждые 15 с.
-const pingInterval = 15 * time.Second
 
 // idleMask — маска tap-подписки на события mpd: объединение того, что
 // запрашивают клиенты (у upmpdcli — playlist player mixer options,
@@ -242,8 +238,6 @@ func (p *Proxy) handle(cli net.Conn) {
 		return
 	}
 	c.clw.Flush()
-
-	go c.pingLoop()
 
 	for {
 		line, err := c.clr.ReadString('\n')
@@ -635,47 +629,6 @@ func (c *pconn) readResponseLocked() ([]string, error) {
 		if l == "OK\n" || strings.HasPrefix(l, "ACK ") {
 			return lines, nil
 		}
-	}
-}
-
-// pingLoop — keepalive бэкенда для соединений в idle: пока клиент сидит
-// в idle, к mpd не уходит ни одной команды, и connection_timeout mpd
-// закрыл бы бэкенд-соединение. Пропускает такты, когда клиент уже не в
-// idle (там команды ходят сами).
-func (c *pconn) pingLoop() {
-	t := time.NewTicker(pingInterval)
-	defer t.Stop()
-	for range t.C {
-		c.mu.Lock()
-		idle := c.idle
-		c.mu.Unlock()
-		if !idle {
-			continue
-		}
-		pdebug(c.id, "ping бэкенду (клиент в idle)")
-		c.bmu.Lock()
-		if err := c.backendWriteLocked("ping"); err != nil {
-			c.bmu.Unlock()
-			c.shutdown()
-			return
-		}
-		// съесть ответ («OK»), иначе он встанет в очередь перед
-		// ответом следующей команды
-		c.be.SetReadDeadline(time.Now().Add(5 * time.Second))
-		for {
-			l, err := c.ber.ReadString('\n')
-			if err != nil {
-				c.be.SetReadDeadline(time.Time{})
-				c.bmu.Unlock()
-				c.shutdown()
-				return
-			}
-			if l == "OK\n" || strings.HasPrefix(l, "ACK ") {
-				break
-			}
-		}
-		c.be.SetReadDeadline(time.Time{})
-		c.bmu.Unlock()
 	}
 }
 
