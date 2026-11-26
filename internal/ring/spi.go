@@ -30,15 +30,15 @@ import (
 )
 
 const (
-	spiDev       = "/dev/spidev0.0"
-	frameHz      = 3346144
-	primeHz      = 1000000
-	primeLen     = 16
-	resetLen     = 128
-	frameLen     = resetLen*2 + leds*bytesPerLED // 400: reset + payload + reset
-	bytesPerLED  = 12                            // 24 бита × 4 SPI-бита / 8
-	spiMajor     = 153
-	spiMinor     = 0
+	spiDev      = "/dev/spidev0.0"
+	frameHz     = 3346144
+	primeHz     = 1000000
+	primeLen    = 16
+	resetLen    = 128
+	frameLen    = resetLen*2 + leds*bytesPerLED // 400: reset + payload + reset
+	bytesPerLED = 12                            // 24 бита × 4 SPI-бита / 8
+	spiMajor    = 153
+	spiMinor    = 0
 )
 
 // encodeByte — байт → 4 байта SPI: бит 0 → 1000b, бит 1 → 1100b.

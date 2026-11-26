@@ -26,7 +26,7 @@ const (
 	DefaultDevice = "/dev/spidev0.0"
 	leds          = 12
 
-	animFPS        = 15                      // fps анимированных сцен: темп тика актора = темп кадров
+	animFPS = 15 // fps анимированных сцен: темп тика актора = темп кадров
 
 	breathePeriod  = 1200 * time.Millisecond // период дыхания сцен
 	spinPeriod     = 1200 * time.Millisecond // оборот бегущего диода (thinking)
@@ -122,8 +122,8 @@ type Ring struct {
 	// DMA-буферы: выделяются один раз и живут вечно — их физические
 	// страницы не возвращаются ядру и не переиспользуются, что исключает
 	// порчу при cache-sync на чужих диапазонах (см. spi.go).
-	frameBuf []byte // 400 байт: reset + payload + reset
-	primeBuf []byte // 16 байт primer @1 МГц
+	frameBuf []byte   // 400 байт: reset + payload + reset
+	primeBuf []byte   // 16 байт primer @1 МГц
 	spiFile  *os.File // persistent fd на /dev/spidev0.0 (открывается на первом draw)
 }
 
@@ -317,7 +317,7 @@ func fire(now time.Time, c [3]byte, scale float64) [12][3]byte {
 	for i := range px {
 		slow := math.Sin(2*math.Pi*ms/float64(fireSlowMS) + float64(i)*2.4)
 		fast := math.Sin(2*math.Pi*ms/float64(fireFastMS) + float64(i)*5.1)
-		px[i] = mul(c, (0.55 + 0.35*slow + 0.10*fast) * scale)
+		px[i] = mul(c, (0.55+0.35*slow+0.10*fast)*scale)
 	}
 	return px
 }
